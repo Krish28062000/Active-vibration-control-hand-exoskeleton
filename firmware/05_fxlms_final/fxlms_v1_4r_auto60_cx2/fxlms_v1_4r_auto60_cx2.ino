@@ -1,0 +1,8083 @@
+/*
+  ============================================================================
+  KK-EXOSKELETON - INTEGRATED NARROWBAND FFT/QUADRATURE + V5.1R MATCHER
+  + QUICK TRIAXIAL DAC AUTHORITY SWEEP + SINGLE-FREQUENCY COMPLEX FXLMS V1.4R AUTO60 AXIS CHARACTERIZATION
+  ============================================================================
+
+  V1.4R AUTO60 CX2 TEST CHANGE
+    The proven V1.4 selected-axis FxLMS controller is retained. Fresh baseline
+    acquisition may now retry transiently rejected blocks (up to 10 attempts
+    to obtain the original 5 good windows, original >=4 minimum preserved).
+    After the normal 10-s independent frozen-W validation, if the SELECTED AXIS
+    itself achieves >=20% attenuation, the firmware automatically continues
+    for an additional 60 s with the SAME frozen Wbest and live ADXL1 reference.
+    No user command is required between the 10-s and 60-s stages. Vector remains
+    diagnostic telemetry only and is NOT used for W selection or AUTO60 trigger.
+
+  V1.4 AXIS-CHARACTERIZATION CHANGE
+    The V1.3 secondary-path identification, live-reference tracking, complex
+    normalized FxLMS update, STARTUP/LEARN/FINE/HOLD states, DAC ceiling,
+    saturation handling, error-quality holds and frozen validation are retained.
+    Wbest qualification is now based on sustained attenuation of the MANUALLY
+    SELECTED X/Y/Z error axis only. X/Y/Z/vector amplitudes are still measured
+    and logged continuously, but ordinary 10-20% vector deterioration no longer
+    rejects Wbest, slows adaptation, or terminates an axis-characterization run.
+    The SELECTED-axis emergency growth guard remains >150% of baseline, while the
+    VECTOR cross-axis coupling guard is relaxed to >200% of baseline for three
+    consecutive valid-reference blocks. Absolute software guards remain unchanged.
+    This mode characterizes single-axis capability and
+    cross-axis redistribution; it is NOT the future triaxial-energy controller.
+
+  V1.3 BASE RETAINED
+    The V1.2 secondary-path identification and core complex normalized FxLMS
+    equation are retained. V1.3 adds a supervisory layer: STARTUP/LEARN/FINE/
+    HOLD states, rolling system-level Wbest retention, vector-aware supervision,
+    temporary error-quality hold instead of 0.48-s abort, a baseline/S_hat-based
+    live-control ceiling independent of the identification probe, complete reject
+    logging, frozen-W validation using new data, and optional A-B-A-B causal
+    validation with command b.
+
+  V1.2 SECONDARY-ID CHANGE RETAINED
+    The validated d (quick DAC sweep) and c (V5.1R amplitude matcher) remain
+    OPTIONAL diagnostics for FxLMS. The secondary-path command i is now made
+    robust against the exact V1.1 failure observed experimentally: it surveys
+    safe probe levels, ranks coherent candidates, uses five-window robust
+    statistics, retries one unstable phase measurement, and falls back to the
+    next-ranked candidate instead of aborting immediately. The normal workflow:
+
+      TOOL ON  -> a
+      choose   -> x / y / z
+      TOOL OFF -> i
+      TOOL ON  -> l 20
+
+    Optional diagnostic path:
+      a -> d -> x/y/z -> c -> i -> l 20
+
+  PURPOSE
+    Preserve the validated Stage-A narrowband FFT/quadrature discovery, quick
+    triaxial DAC authority sweep, V5.1R amplitude matcher, legacy tracked phase
+    sweep, dual-ADXL SPI path, safety logic and 10 kHz phase-continuous NCO.
+    FxLMS minimizes the live ADXL2 selected-axis residual without requiring an
+    actuator-only amplitude match while the tool is running.
+
+  SECONDARY-PATH IDENTIFICATION WITHOUT c - V1.2 ROBUST SEARCH
+    Command i no longer stops at the first barely acceptable actuator probe.
+    It surveys safe DAC levels 5..21, measures five windows per level, removes
+    one clearly inconsistent window when possible, ranks coherent candidates,
+    then performs robust 0/90/0 secondary-path identification. A failed phase
+    is retried once; if it remains unstable, i automatically falls back to the
+    next-ranked probe. d and c remain optional diagnostics.
+
+  IMPORTANT
+    - d and c remain available and unchanged as diagnostics/thesis-development
+      tools.
+    - legacy command w still requires c, because that experiment deliberately
+      starts from the matched fixed-amplitude state.
+    - FxLMS command amplitude and phase are determined by the complex weight W
+      and the live normalized ADXL1 reference phasor r: U = W*r.
+    - ADXL2 X/Y/Z and vector are still logged continuously.
+    - If mounting/hand mechanics change materially, re-run i before l.
+  ============================================================================
+*/
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <arduinoFFT.h>
+#include <math.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+/*
+  ============================================================================
+  KK-EXOSKELETON - UNIVERSAL XYZ ADAPTIVE AMPLITUDE MATCHER V5.1R ROBUST LOCAL-REBRACKET - ARDUINO 1.8.x COMPILE FIX
+  ESP32 Arduino Core 3.x + ADXL345 SPI + TPA3116D2 + Visaton EX 45 S
+  ============================================================================
+
+  DESIGN GOAL
+    Reliably acquire and regulate one selected exact-frequency acceleration
+    component (X, Y or Z) even when the physical DAC -> acceleration mapping
+    drifts between runs or slowly changes during a run.
+
+  FINAL ARCHITECTURE
+    1) phase-continuous 10 kHz hardware-timer NCO;
+    2) exact-command-frequency NCO-referenced X/Y/Z I/Q measurement;
+    3) robust same-DAC repeated-point validation;
+    4) hybrid sign-bracketed root finder (secant/regula-falsi + bisection);
+    5) robust local dA/dDAC slope memory;
+    6) slow, conservative PI amplitude servo around the continuously running NCO;
+    7) automatic transient confirmation and bounded reacquisition;
+    8) closed-loop amplitude-hold statistics with quantization-aware regulation;
+    9) final triaxial vector FFT frequency verification;
+   10) V5.1 candidate confirmation + state-aware plant-change guard;
+   11) verified trial/revert DAC corrections;
+   12) conservative warm-start from the last proven same-condition solution;
+   13) bounded local re-bracketing after a moved bracket, before any full restart.
+
+  IMPORTANT CONTROL PRINCIPLE
+    DAC is NOT the controlled physical quantity.
+    The selected exact-frequency acceleration is controlled.
+    Therefore DAC is allowed to move slowly during closed-loop regulation.
+
+  IMPORTANT PHASE PRINCIPLE
+    Frequency/phase generation never restarts while matching or tracking.
+    Amplitude table changes occur only at NCO phase wrap (near sine zero),
+    avoiding a mid-cycle amplitude discontinuity.
+
+  IMPORTANT MEASUREMENT PRINCIPLE
+    The same canonical estimator is used throughout acquisition and regulation:
+      3 windows x 512 samples/window at 1600 samples/s.
+    Timing-bad windows are discarded individually; clean windows remain usable.
+    Amplitude validity is determined from the exact-frequency amplitude estimator,
+    repeatability, sensor integrity and stability. Phase/Sync diagnostics do not gate
+    amplitude acquisition or amplitude-hold PASS.
+
+  IMPORTANT MEMORY PRINCIPLE
+    All large FFT/sample buffers are global/static. No large search/history arrays
+    are placed on the ESP32 loop-task stack. Closed-loop statistics use running
+    accumulators instead of large local arrays. This directly avoids the stack
+    corruption that produced the previous "Double exception" Guru Meditation.
+
+  HARDWARE
+    ADXL1 CS GPIO5   : forced HIGH, not read
+    ADXL2 CS GPIO17  : rigidly mounted to Visaton/final actuator plate
+    SPI SCK GPIO18
+    SPI MISO GPIO19
+    SPI MOSI GPIO23
+    ADXL SPI: 5 MHz, MSBFIRST, SPI_MODE3 (preserved from working V4)
+    ESP32 DAC GPIO25 -> TPA3116D2 -> Visaton EX 45 S
+
+  SERIAL COMMANDS (115200 baud, Newline)
+    f 268       set frequency [20...350 Hz]
+    t 1.20      set selected-axis target peak acceleration [m/s^2]
+    x / y / z   select control axis
+    h 8         set closed-loop hold duration [5...30 s]
+    n 5         set number of independent full runs [1...8]
+
+    r           one COMPLETE run:
+                acquire -> servo lock -> closed-loop hold -> FFT -> stop
+    v           N independent COMPLETE runs
+
+    m           acquire + servo lock only; leave actuator running
+    k 30        track current acquired target for 5...600 s
+    q 15        fixed-DAC 3-record diagnostic at DAC 15
+    g           final local triaxial FFT at current running command
+
+    p           settings/status
+    s           emergency stop
+    ?           help
+
+  RECOMMENDED FIRST VALIDATION
+    f 272
+    t 1.20
+    z
+    h 8
+    n 1
+    r
+
+  Then, without moving the setup:
+    n 5
+    v
+  ============================================================================
+*/
+
+// ============================================================================
+// DATA TYPES
+// ============================================================================
+
+enum class ControlAxis : uint8_t { X_AXIS = 0, Y_AXIS = 1, Z_AXIS = 2 };
+
+enum class AcquireStatus : uint8_t {
+  OK,
+  QUANTIZATION_LIMITED,
+  TARGET_BELOW_RANGE,
+  TARGET_ABOVE_RANGE,
+  NONSTATIONARY,
+  HARDWARE_FAULT,
+  SAFETY_STOP,
+  ABORTED
+};
+
+enum class ServoStatus : uint8_t {
+  LOCKED,
+  COMPLETED,
+  NEEDS_REACQUIRE,
+  AUTHORITY_LIMIT,
+  HARDWARE_FAULT,
+  SAFETY_STOP,
+  ABORTED
+};
+
+enum class PhaseClass : uint8_t { STRONG, MODERATE, WEAK };
+
+struct RawAcceleration {
+  int16_t x;
+  int16_t y;
+  int16_t z;
+};
+
+struct AxisSyncResult {
+  double amplitudeMs2;
+  double phaseDeg;
+  double syncRatio;
+};
+
+struct WindowResult {
+  bool valid;
+  bool communicationFault;
+  bool rawClipped;
+  bool timingFault;
+  uint16_t zeroTriplets;
+  uint16_t longestStagnantRun;
+  uint32_t lateSamples;
+  uint32_t maxLatenessUs;
+  AxisSyncResult axis[3];
+  double totalAmplitudeMs2;
+};
+
+struct ControlRecord {
+  bool measured;
+  bool amplitudeValid;
+  bool phaseReadyStrong;
+  bool communicationFault;
+  bool rawClipped;
+  bool safetyExceeded;
+  bool timingRejected;
+  uint8_t validWindows;
+  uint8_t inlierCount;
+  bool windowValid[3];
+  double windowSelectedMs2[3];
+  double dac;
+  uint32_t timestampMs;
+
+  double selectedMedianMs2;
+  double selectedMeanMs2;
+  double axisMeanMs2[3];
+  double axisSync[3];
+  double axisPhaseDeg[3];
+  double selectedPhaseSdDeg;
+  double totalMeanMs2;
+  double madPercent;
+  double cvPercent;
+};
+
+struct StablePoint {
+  bool valid;
+  bool stationary;
+  bool phaseReadyStrong;
+  bool safetyExceeded;
+  bool hardwareFault;
+  double dac;
+  double amplitudeMs2;
+  double pairDriftPercent;
+  uint8_t recordsUsed;
+  uint32_t timestampMs;
+  double axisMeanMs2[3];
+  double axisSync[3];
+  double axisPhaseDeg[3];
+  double totalMeanMs2;
+  double selectedPhaseSdDeg;
+};
+
+struct AcquisitionResult {
+  AcquireStatus status;
+  bool success;
+  StablePoint candidate;
+  StablePoint low;
+  StablePoint high;
+  uint16_t recordsMeasured;
+  uint16_t qualityRejects;
+  uint8_t restarts;
+  uint32_t elapsedMs;
+};
+
+struct PlantBaseline {
+  bool valid;
+  double dac;
+  double selectedMs2;
+  double selectedCvPercent;
+  double axisMeanMs2[3];
+  double totalMeanMs2;
+};
+
+struct WarmStartMemory {
+  bool valid;
+  ControlAxis axis;
+  double frequencyHz;
+  double targetMs2;
+  double dac;
+};
+
+struct ServoState {
+  double integralErrorMs2;
+  int8_t persistentSign;
+  uint8_t persistenceCount;
+  uint8_t invalidCount;
+  uint8_t unproductiveCorrections;
+
+  // V5.1: a small same-DAC plant fingerprint established only from
+  // confirmed stable records. It is a state detector, not a calibration map.
+  PlantBaseline plantBaseline;
+
+  // V5.1: every DAC correction is a bounded trial. Two post-step records
+  // verify improvement before the new DAC is accepted and its slope is learned.
+  bool trialPending;
+  double trialOldDac;
+  double trialOldAmp;
+  double trialOldErrorPct;
+  PlantBaseline trialOldBaseline;
+  uint8_t trialValidCount;
+  double trialAmp[2];
+  double trialAxisSum[3];
+  double trialTotalSum;
+  double trialMaxCvPercent;
+
+  bool havePrevious;
+  ControlRecord previous;
+};
+
+struct RunningStats {
+  uint16_t n;
+  double mean;
+  double m2;
+  double minValue;
+  double maxValue;
+};
+
+struct HoldResult {
+  bool completed;
+  bool amplitudePass;
+  bool phaseSweepReady;
+  ServoStatus status;
+  uint16_t validRecords;
+  uint16_t tightInBandRecords;
+  uint16_t finalInBandRecords;
+  uint16_t corrections;
+  uint16_t reacquireEvents;
+
+  double meanAmplitudeMs2;
+  double sdAmplitudeMs2;
+  double cvPercent;
+  double meanErrorPercent;
+  double tightInBandPercent;
+  double finalInBandPercent;
+  double rmsErrorPercent;
+  double maxAbsErrorPercent;
+
+  double meanSyncRatio;
+  double phaseSpanDeg;
+  double minAmplitudeMs2;
+  double maxAmplitudeMs2;
+  double minDac;
+  double maxDac;
+  double meanDac;
+  PhaseClass phaseClass;
+};
+
+struct VectorFftResult {
+  bool valid;
+  double frequencyHz;
+  double xAmplitudeMs2;
+  double yAmplitudeMs2;
+  double zAmplitudeMs2;
+  double totalAmplitudeMs2;
+  double snrDb;
+  char dominantAxis;
+};
+
+struct CompleteRunResult {
+  bool completed;
+  bool amplitudePass;
+  bool cancellationReady;
+  bool matchLockAchieved;
+  uint32_t matchLockTimeMs;
+  uint32_t totalRunTimeMs;
+  double finalDac;
+  AcquisitionResult acquisition;
+  HoldResult hold;
+  VectorFftResult fft;
+};
+
+
+// ============================================================================
+// INTEGRATED NARROWBAND DISCOVERY TYPES
+// ============================================================================
+
+struct DiscoveryTiming {
+  uint32_t elapsedUs;
+  double meanReadSeparationUs;
+  uint32_t maxReadSeparationUs;
+  uint32_t maxScheduleLatenessUs;
+  uint32_t lateSampleCount;
+  uint16_t zeroTriplets;
+  uint16_t clippedSamples;
+  bool valid;
+};
+
+struct DiscoveryAxisFFTResult {
+  bool valid;
+  uint16_t bin;
+  double frequencyHz;
+  double amplitudeMs2;
+  double snrDb;
+};
+
+struct DiscoverySensorFFTResult {
+  DiscoveryAxisFFTResult axis[3];
+};
+
+struct DiscoveryAxisQuadResult {
+  bool valid;
+  double referenceHz;
+  double correctionHz;
+  double refinedHz;
+  double amplitudeMs2;
+  double phaseDeg;
+
+  // Whole-record synchronous ratio is retained as a DIAGNOSTIC only.  A
+  // hand-held tool can drift in frequency/phase over the 1.6 s record, so
+  // this quantity is deliberately NOT the primary acceptance gate in V1.3.
+  double syncRatio;
+
+  // Drift-tolerant synchronization: synchronous ratio is calculated inside
+  // each 256-sample (~160 ms) block and the median is used for quality gating.
+  double localMedianSyncRatio;
+  uint8_t localGoodBlocks;
+
+  double phaseFitRmseDeg;
+};
+
+struct DiscoverySensorAtF0 {
+  DiscoveryAxisQuadResult axis[3];
+  double vectorAmplitudeMs2;
+  double J;
+};
+
+struct DiscoveryCandidate {
+  bool fftValid;
+  bool quadValid;
+  uint8_t fftRank;
+  uint16_t bin;
+  double fftSeedHz;
+  double fftVectorAmplitudeMs2;
+  double fftSnrDb;
+  double refinedHz;
+  double toolVectorAmplitudeMs2;
+  double handVectorAmplitudeMs2;
+
+  // Long-record sync is retained for reporting; local sync is the principal
+  // drift-tolerant quality metric used by the V1.3 discovery gate.
+  double toolWeightedSync;
+  double toolWeightedLocalSync;
+  double toolWeightedPhaseRmseDeg;
+  uint8_t supportAxes;
+
+  // Independent FFT peak consensus around the candidate.  This prevents a
+  // low-sync but clearly repeated X/Y/hand frequency family from being called
+  // "ambiguous", while still rejecting isolated/spurious candidates.
+  uint8_t toolFrequencyConsensusAxes;
+  uint8_t handFrequencyConsensusAxes;
+
+  double qualityScore;
+  DiscoverySensorAtF0 toolAtCandidate;
+  DiscoverySensorAtF0 handAtCandidate;
+};
+
+enum class IntegratedWorkflowState : uint8_t {
+  NEED_BASELINE,
+  AWAIT_AXIS,
+  AWAIT_TOOL_OFF,
+  MATCHING,
+  AWAIT_PHASE_TOOL_ON,      // legacy tracked phase-sweep entry after c
+  PHASE_SWEEP_RUNNING,
+  AWAIT_SECONDARY_ID,       // TOOL OFF -> run i
+  FXLMS_READY,              // secondary path identified; TOOL ON -> run l
+  FXLMS_RUNNING
+};
+
+struct QuickDacPoint {
+  bool valid;
+  double dac;
+  double axisMeanMs2[3];
+  double axisCvPercent[3];
+  double axisSync[3];
+  double vectorMeanMs2;
+};
+
+struct PhaseHoldPoint {
+  bool valid;
+  double commandPhaseDeg;
+  uint8_t validSamples;
+  double selectedMeanMs2;
+  double selectedSdMs2;
+  double selectedCvPercent;
+  double selectedMinMs2;
+  double selectedMaxMs2;
+  double axisMeanMs2[3];
+  double axisCvPercent[3];
+  double vectorMeanMs2;
+  double vectorCvPercent;
+  double selectedReductionPercent;
+  double vectorChangePercent;
+  double axisChangePercent[3];
+};
+
+// V2.0 Stage-C types: paired ADXL1/ADXL2 acquisition and tool-referenced tracking.
+struct PairedTrackingWindow {
+  bool valid;
+  bool communicationFault;
+  bool rawClipped;
+  bool timingFault;
+  uint32_t lateSamples;
+  uint32_t maxLatenessUs;
+  uint32_t centerUs;
+  double commandOffsetMidDeg;
+  AxisSyncResult toolAxis[3];
+  AxisSyncResult handAxis[3];
+  double handVectorMs2;
+};
+
+struct PhaseTrackerState {
+  bool initialized;
+  uint8_t referenceAxis;
+  double lastToolPhaseDeg;
+  uint32_t lastCenterUs;
+  double filteredFrequencyErrorHz;
+  uint16_t validUpdates;
+  uint16_t rejectedUpdates;
+};
+
+struct TrackedPhasePoint {
+  bool valid;
+  double targetRelativePhaseDeg;
+  uint8_t referenceAxis;
+  uint8_t validSamples;
+  double selectedMeanMs2;
+  double selectedSdMs2;
+  double selectedCvPercent;
+  double selectedMinMs2;
+  double selectedMaxMs2;
+  double axisMeanMs2[3];
+  double axisCvPercent[3];
+  double vectorMeanMs2;
+  double vectorCvPercent;
+  double selectedReductionPercent;
+  double vectorChangePercent;
+  double axisChangePercent[3];
+  double trackingErrorMeanDeg;
+  double trackingErrorSdDeg;
+  double trackingErrorMaxAbsDeg;
+  double meanToolSync;
+  double meanToolAmplitudeMs2;
+};
+
+// ============================================================================
+// SINGLE-FREQUENCY COMPLEX FXLMS TYPES (V1.0)
+// ============================================================================
+
+struct FxComplex {
+  double re;
+  double im;
+};
+
+struct FxSecondaryPathProbe {
+  bool valid;
+  double commandPhaseDeg;
+  uint8_t validWindows;
+  double meanResponseMs2;
+  double meanSync;
+  double gainMs2PerDac;
+  double phaseDeg;
+  double gainCvPercent;
+  double phaseSdDeg;
+};
+
+struct FxBaseline {
+  bool valid;
+  uint8_t validWindows;
+  double axisMeanMs2[3];
+  double vectorMeanMs2;
+  double selectedMeanMs2;
+  double referenceMeanMs2;
+};
+
+struct FxValidationResult {
+  bool valid;
+  uint16_t validWindows;
+  double axisMeanMs2[3];
+  double axisCvPercent[3];
+  double vectorMeanMs2;
+  double vectorCvPercent;
+  double selectedMeanMs2;
+  double selectedCvPercent;
+  double selectedReductionPercent;
+  double vectorReductionPercent;
+};
+
+// V1.3 supervisory state. The core complex FxLMS equation remains unchanged.
+enum class FxAdaptiveState : uint8_t {
+  STARTUP,
+  LEARN,
+  FINE,
+  HOLD
+};
+
+struct FxRollingPerformance {
+  double selectedReductionPct[5];
+  double vectorReductionPct[5];
+  FxComplex appliedW[5];
+  uint8_t count;
+  uint8_t head;
+};
+
+struct FxRollingSummary {
+  bool full;
+  double meanSelectedReductionPct;
+  double meanVectorReductionPct;
+  uint8_t positiveSelectedBlocks;
+  uint8_t positiveVectorBlocks;
+  uint8_t deepSelectedBlocks;
+};
+
+struct FxCausalSegmentResult {
+  bool valid;
+  uint16_t validWindows;
+  double axisMeanMs2[3];
+  double vectorMeanMs2;
+  double referenceMeanMs2;
+};
+
+
+// ============================================================================
+// HARDWARE
+// ============================================================================
+
+static const uint8_t PIN_CS_ADXL1 = 5;
+static const uint8_t PIN_CS_ADXL2 = 17;
+static const uint8_t PIN_SPI_SCK = 18;
+static const uint8_t PIN_SPI_MISO = 19;
+static const uint8_t PIN_SPI_MOSI = 23;
+static const uint8_t PIN_VISATON_DAC = 25;
+
+static const uint8_t REG_DEVID = 0x00;
+static const uint8_t REG_BW_RATE = 0x2C;
+static const uint8_t REG_POWER_CTL = 0x2D;
+static const uint8_t REG_DATA_FORMAT = 0x31;
+static const uint8_t REG_DATAX0 = 0x32;
+static const uint8_t SPI_READ_BIT = 0x80;
+static const uint8_t SPI_MB_BIT = 0x40;
+static const uint8_t ADXL_DEVID_OK = 0xE5;
+
+SPISettings adxlSpiSettings(5000000, MSBFIRST, SPI_MODE3);
+
+// ============================================================================
+// SENSOR / SAMPLE SETTINGS
+// ============================================================================
+
+static const double SAMPLE_RATE_HZ = 1600.0;
+static const uint32_t SAMPLE_PERIOD_US = 625;
+
+// Allow small scheduler/SPI jitter. A whole window is rejected only if more
+// than a few samples exceed this threshold.
+static const uint32_t LATE_SAMPLE_WARNING_US = 25;
+static const uint8_t MAX_LATE_SAMPLES_PER_WINDOW = 4;
+
+static const double ADXL_G_PER_LSB = 0.0039;
+static const double GRAVITY_MS2 = 9.80665;
+static const double ADXL_MS2_PER_LSB = ADXL_G_PER_LSB * GRAVITY_MS2;
+
+// ADXL345 full-resolution +/-16 g is ~ +/-4100 counts, NOT +/-32768 counts.
+// 4000 is therefore a useful conservative clipping warning threshold.
+static const int16_t ADXL_RAW_CLIP_LIMIT = 4000;
+static const uint16_t MAX_ZERO_TRIPLETS = 5;
+static const uint16_t MAX_STAGNANT_RUN = 20;
+
+// Software guardrails only; not certified safety limits.
+static const double AXIS_SOFTWARE_GUARD_MS2 = 25.0;
+static const double TOTAL_SOFTWARE_GUARD_MS2 = 30.0;
+
+// ============================================================================
+// NCO / COMMAND SETTINGS
+// ============================================================================
+
+static const double COMMAND_MIN_HZ = 20.0;
+static const double COMMAND_MAX_HZ = 350.0;
+static const double DAC_MIN = 3.0;
+static const double DAC_MAX = 29.0;
+
+// Keep the experimentally characterized command quantum for V3.
+// 0.125 can be tested later as an optional experiment; it is not assumed here.
+static const double DAC_QUANTUM = 0.25;
+
+static const uint32_t DAC_UPDATE_RATE_HZ = 10000;
+static const uint32_t TIMER_BASE_FREQUENCY_HZ = 1000000;
+static const uint64_t TIMER_ALARM_TICKS = 100; // 1 MHz / 100 = 10 kHz
+
+hw_timer_t *visatonTimer = nullptr;
+volatile bool visatonRunning = false;
+volatile uint32_t visatonPhaseAccumulator = 0;
+volatile uint32_t visatonPhaseIncrement = 0;
+volatile uint32_t visatonPhaseOffsetCurrent = 0;
+volatile uint32_t visatonPhaseOffsetTarget = 0;
+
+// Double-buffered tables: amplitude switches only at phase wrap.
+uint8_t visatonSineTable[2][256];
+volatile uint8_t activeSineTable = 0;
+volatile uint8_t pendingSineTable = 1;
+volatile bool amplitudeTablePending = false;
+
+double currentDacAmplitude = 0.0;
+double currentCommandFrequencyHz = 0.0;
+
+// ============================================================================
+// CANONICAL EXACT-FREQUENCY ESTIMATOR
+// ============================================================================
+
+static const uint16_t CONTROL_SAMPLES = 512;
+static const uint8_t CONTROL_WINDOWS = 3;
+static const uint8_t CONTROL_MIN_INLIERS = 2;
+static const uint16_t WINDOW_GAP_MS = 20;
+
+static const double WINDOW_OUTLIER_PERCENT = 15.0;
+static const double RECORD_MAX_MAD_PERCENT = 10.0;
+static const double RECORD_MAX_CV_PERCENT = 8.0;
+static const double MIN_REPORT_AMPLITUDE_MS2 = 0.03;
+
+// Phase readiness is separate from amplitude validity.
+static const double PHASE_STRONG_MIN_SYNC = 0.80;
+static const double PHASE_STRONG_MAX_RECORD_SD_DEG = 8.0;
+static const double PHASE_MODERATE_MIN_SYNC = 0.65;
+
+// ============================================================================
+// SETTLING / STABLE-POINT SETTINGS
+// ============================================================================
+
+static const uint16_t SETTLE_BASE_MS = 400;
+static const uint16_t SETTLE_PER_DAC_MS = 45;
+static const uint16_t SETTLE_MAX_MS = 1400;
+static const double SETTLE_MIN_CYCLES = 25.0;
+
+// Up to 3 canonical records at the SAME DAC. The closest pair is accepted only
+// if they agree sufficiently, allowing one transient record to be ignored.
+static const uint8_t STABLE_POINT_MAX_RECORDS = 3;
+static const double STABLE_PAIR_MAX_DRIFT_PERCENT = 6.0;
+
+// ============================================================================
+// HYBRID ACQUISITION SETTINGS
+// ============================================================================
+
+static const double COARSE_DAC_STEP = 2.0;
+// V5 two-band logic:
+//   PREFERRED: the target we actively try to reach during acquisition.
+//   ACCEPTED : a safe fallback that is retained while one bounded interpolation
+//              refinement is attempted. The fallback is restored if refinement
+//              does not produce a genuinely better measured point.
+static const double PREFERRED_BAND_PERCENT = 2.5;
+static const double ACCEPTED_BAND_PERCENT = 5.0;
+static const double REFINEMENT_IMPROVEMENT_EPS_PERCENT = 0.10;
+static const uint8_t MAX_REFINE_ITERATIONS = 12;
+static const uint8_t MAX_ACQUISITION_RESTARTS = 2;
+static const uint32_t BRACKET_MAX_AGE_MS = 18000;
+static const double SECANT_GUARD_FRACTION = 0.20;
+
+// V5.1R local re-bracket recovery. If a previously valid bracket moves because
+// the plant changes, do NOT immediately restart the whole DAC 3...29 scan.
+// Re-measure near the old root and move only in the direction required to
+// recover a fresh sign crossing. A full V5.1 restart remains the fallback.
+static const double LOCAL_REBRACKET_STEP_DAC = 0.50;
+static const double LOCAL_REBRACKET_RADIUS_DAC = 3.00;
+static const uint8_t LOCAL_REBRACKET_MAX_STEPS = 6;
+
+// Common-path / transient detection.
+static const double SAME_DAC_ABRUPT_PERCENT = 20.0; // retained as a hard fallback guard
+static const double COMMON_PATH_COLLAPSE_PERCENT = 35.0;
+
+// V5.1 final-candidate confirmation. Keep this deliberately small: three
+// canonical records, accepting at least two clean ones.
+static const uint8_t CANDIDATE_CONFIRM_RECORDS = 3;
+static const uint8_t CANDIDATE_CONFIRM_MIN_VALID = 2;
+static const double CANDIDATE_CONFIRM_MAX_CV_PERCENT = 5.0;
+static const double CANDIDATE_CONFIRM_MAX_SPREAD_PERCENT = 10.0;
+
+// V5.1 adaptive same-DAC plant-change guard. Normal stable data in the new
+// validation sets is usually ~1-3% variable; deliberate posture changes caused
+// persistent ~10-17% shifts. The threshold therefore adapts to the confirmed
+// baseline CV but is never made hypersensitive.
+static const double PLANT_CHANGE_MIN_PERCENT = 8.0;
+static const double PLANT_CHANGE_MAX_PERCENT = 15.0;
+static const double PLANT_CHANGE_CV_GAIN = 3.0;
+static const double PLANT_CHANGE_CV_OFFSET_PERCENT = 3.0;
+static const double PLANT_VECTOR_CHANGE_PERCENT = 12.0;
+
+// V5.1 verified correction: one step is only kept after two clean post-step
+// records show a real improvement.
+static const uint8_t TRIAL_VERIFY_RECORDS = 2;
+static const double TRIAL_REQUIRED_IMPROVEMENT_PERCENT = 0.25;
+
+// Warm-start is only a search-location hint. It is never trusted without a
+// fresh same-DAC measurement and is used only for nearly identical conditions.
+static const double WARM_START_MAX_FREQUENCY_DELTA_HZ = 1.0;
+static const double WARM_START_MAX_TARGET_DELTA_PERCENT = 3.0;
+
+// ============================================================================
+// SLOW SERVO SETTINGS
+// ============================================================================
+
+static const double SERVO_DEADBAND_PERCENT = ACCEPTED_BAND_PERCENT; // hold stable accepted solutions
+static const double SERVO_LOCK_BAND_PERCENT = ACCEPTED_BAND_PERCENT;
+static const uint8_t SERVO_LOCK_CONSECUTIVE_RECORDS = 2;
+static const uint8_t SERVO_ACQUIRE_MAX_RECORDS = 16;
+static const uint8_t SERVO_ERROR_PERSISTENCE_RECORDS = 3; // modest errors must persist before correction
+static const uint8_t SERVO_SEVERE_PERSISTENCE_RECORDS = 2;
+static const double SERVO_QUANTIZATION_GUARD_MARGIN_PERCENT = 0.50;
+
+// Conservative PI in amplitude space; divided by local slope to obtain DAC step.
+static const double SERVO_KP = 0.45;
+static const double SERVO_KI = 0.04;
+static const double INTEGRAL_LIMIT_TARGET_FRACTION = 0.50;
+
+static const double SERVO_NORMAL_MAX_STEP_DAC = 0.25;
+static const double SERVO_SEVERE_MAX_STEP_DAC = 0.50;
+static const double SERVO_SEVERE_ERROR_PERCENT = 10.0;
+
+static const double MIN_VALID_SLOPE = 0.005;  // m/s^2 per DAC
+static const double MAX_VALID_SLOPE = 10.0;
+static const uint8_t MAX_SLOPE_HISTORY = 5;
+static const uint8_t MAX_CONSECUTIVE_INVALID_SERVO_RECORDS = 3;
+static const uint8_t MAX_UNPRODUCTIVE_CORRECTIONS = 2;
+static const uint8_t MAX_RUNTIME_REACQUIRES = 2;
+
+// ============================================================================
+// CLOSED-LOOP HOLD / THESIS ACCEPTANCE
+// ============================================================================
+
+static const double HOLD_TIGHT_BAND_PERCENT = PREFERRED_BAND_PERCENT; // preferred reported band
+static const double HOLD_FINAL_BAND_PERCENT = ACCEPTED_BAND_PERCENT; // primary accepted/pass band
+static const double HOLD_MAX_CV_PERCENT = 5.0;
+static const double HOLD_MAX_RMS_ERROR_PERCENT = 5.0; // primary time-domain tracking quality
+// +/-5% in-band percentage is reported, not used as a binary gate.
+static const uint8_t HOLD_MIN_VALID_RECORDS = 3;
+
+// Stronger readiness gate for the next phase-sweep experiment. This does not
+// alter the existing amplitude PASS definition.
+static const double PHASE_READY_MIN_IN_BAND_PERCENT = 75.0;
+static const double PHASE_READY_MAX_CV_PERCENT = 3.0;
+static const double PHASE_READY_MAX_RMS_ERROR_PERCENT = 4.0;
+static const uint16_t PHASE_READY_MAX_CORRECTIONS = 1;
+
+// Phase classification from the closed-loop hold.
+static const double HOLD_STRONG_SYNC = 0.80;
+static const double HOLD_STRONG_PHASE_SPAN_DEG = 5.0;
+static const double HOLD_MODERATE_SYNC = 0.65;
+static const double HOLD_MODERATE_PHASE_SPAN_DEG = 10.0;
+
+// ============================================================================
+// FFT SETTINGS
+// ============================================================================
+
+static const uint16_t FFT_SAMPLES = 1024;
+static const uint16_t HALF_BINS = FFT_SAMPLES / 2;
+static const uint8_t FFT_FRAMES = 3;
+static const double HAMMING_COHERENT_GAIN = 0.54;
+static const double LOCAL_SEARCH_HALF_WIDTH_HZ = 8.0;
+static const double FFT_MIN_AMPLITUDE_MS2 = 0.03;
+static const double FFT_MIN_SNR_DB = 3.0;
+static const uint8_t FFT_PEAK_EXCLUSION_BINS = 3;
+
+// ============================================================================
+// QUICK DAC AUTHORITY + 12-PHASE HOLD SETTINGS (V1.6)
+// ============================================================================
+
+// Fast actuator-only authority diagnostic before axis selection.
+static const uint16_t QUICK_DAC_WINDOW_SAMPLES = 256;  // 160 ms
+static const uint8_t QUICK_DAC_WINDOWS = 2;
+static const uint16_t QUICK_DAC_WINDOW_GAP_MS = 15;
+static const uint16_t QUICK_DAC_SETTLE_MS = 350;
+static const double QUICK_DAC_MAX_CV_PERCENT = 8.0;
+static const uint8_t QUICK_DAC_POINT_COUNT = 7;
+static const double QUICK_DAC_LEVELS[QUICK_DAC_POINT_COUNT] = {
+  5.0, 9.0, 13.0, 17.0, 21.0, 25.0, 29.0
+};
+
+// V1.6 Stage C deliberately trades speed for evidence quality.
+// Twelve fixed command phases (0..330 deg in 30 deg steps) are each held for
+// five seconds. Ten short exact-frequency triaxial windows are distributed
+// across each hold so we can see mean response, variability and min/max rather
+// than trusting a single 40 ms snapshot. There is still NO live phase tracking.
+static const uint8_t PHASE_HOLD_POINT_COUNT = 12;
+static const double PHASE_HOLD_STEP_DEG = 30.0;
+static const uint32_t PHASE_HOLD_DURATION_MS = 5000;
+static const uint8_t PHASE_HOLD_MEASUREMENTS = 10;
+static const uint8_t PHASE_HOLD_MIN_VALID = 8;
+static const uint16_t PHASE_HOLD_WINDOW_SAMPLES = 256; // 160 ms at 1600 Hz
+static const uint16_t PHASE_HOLD_POST_SLEW_SETTLE_MS = 250;
+static const uint16_t PHASE_HOLD_TOOL_STEADY_DELAY_MS = 1000;
+static const uint16_t PHASE_HOLD_SAMPLE_PERIOD_MS = 500;
+
+// Only the coarse reconnaissance stage is accelerated. A clean canonical
+// record farther than 20% from target is sufficient to locate the target
+// region. Inside +/-20%, the original robust 2-record / optional 3rd-record
+// stable-pair logic is retained. Candidate confirmation and servo lock are
+// unchanged.
+static const double FAST_COARSE_SINGLE_RECORD_ERROR_PERCENT = 20.0;
+
+// Experimental software abort ceilings only; they are NOT physiological limits.
+static const double PHASE_AXIS_ABORT_MS2 = 8.0;
+static const double PHASE_VECTOR_ABORT_MS2 = 10.0;
+
+// Phase offset is slewed in the 10 kHz ISR rather than jumped instantaneously.
+// 0.25 degree/tick => worst-case 180 degree move in about 72 ms.
+static const uint32_t PHASE_SLEW_WORD_PER_ISR = 2982616UL;
+
+// ============================================================================
+// V2.0 TOOL-REFERENCED PHASE TRACKING SETTINGS
+// ============================================================================
+// 256 samples = 160 ms. This is short enough that the free-running tool phase
+// moves only modestly within one window, while still containing ~40 cycles at
+// the present 240..320 Hz operating band.
+static const uint16_t TRACK_WINDOW_SAMPLES = 256;
+static const uint32_t TRACK_LATE_SAMPLE_WARNING_US = 40;
+static const uint8_t TRACK_MAX_LATE_SAMPLES = 8;
+
+// ADXL1 reference-quality gates. These are deliberately compatible with the
+// drift-tolerant local-sync behaviour already observed in Stage A.
+static const double TRACK_MIN_TOOL_SYNC = 0.30;
+static const double TRACK_MIN_TOOL_AMPLITUDE_MS2 = 0.04;
+static const double TRACK_MIN_LIVE_TO_BASELINE_RATIO = 0.25;
+static const double TRACK_MAX_LIVE_TO_BASELINE_RATIO = 4.00;
+
+// Before Stage C, c measures actuator leakage into ADXL1 while the tool is OFF.
+// <=25% is GOOD; 25..50% is MARGINAL but allowed; >50% is rejected because the
+// reference could become dominated by the controller's own secondary field.
+static const double TRACK_GOOD_REFERENCE_LEAK_RATIO = 0.25;
+static const double TRACK_MAX_REFERENCE_LEAK_RATIO = 0.50;
+
+// ============================================================================
+// SINGLE-FREQUENCY COMPLEX NORMALIZED FXLMS SETTINGS (V1.0)
+// ============================================================================
+// These are conservative engineering starting values for the FIRST hardware
+// experiment. They are not universal scientific acceptance thresholds.
+static const uint16_t FX_BLOCK_SAMPLES = 256;              // 160 ms @ 1600 Hz
+static const uint8_t FX_BASELINE_WINDOWS = 5;
+static const uint8_t FX_BASELINE_MIN_VALID = 4;
+static const uint8_t FX_SEC_PROBE_COUNT = 3;
+static const double FX_SEC_PROBE_PHASES_DEG[FX_SEC_PROBE_COUNT] = {0.0, 90.0, 0.0};
+// V1.2: five windows give enough redundancy to reject one mechanical transient.
+static const uint8_t FX_SEC_WINDOWS_PER_PROBE = 5;
+static const uint8_t FX_SEC_MIN_VALID_WINDOWS = 4;
+static const uint16_t FX_SEC_SETTLE_MS = 300;
+static const double FX_SEC_MIN_RESPONSE_MS2 = 0.05;
+static const double FX_SEC_MIN_SYNC = 0.25;
+static const double FX_SEC_MIN_MEAN_SYNC = 0.40;
+static const double FX_SEC_PREFERRED_MEAN_SYNC = 0.55;
+static const double FX_SEC_MAX_GAIN_CV_PERCENT = 10.0;
+static const double FX_SEC_MAX_PHASE_SD_DEG = 15.0;
+// Loose inlier gates only remove an obvious transient; final CV/phase gates stay strict.
+static const double FX_SEC_OUTLIER_GAIN_DEV_PERCENT = 25.0;
+static const double FX_SEC_OUTLIER_PHASE_DEV_DEG = 25.0;
+static const uint8_t FX_SEC_PHASE_RETRIES = 1;
+
+static const uint8_t FX_STARTUP_BLOCKS = 5;
+static const double FX_STARTUP_MU = 0.005;
+static const double FX_DEFAULT_NORMAL_MU = 0.020;
+static const double FX_MIN_USER_MU = 0.001;
+static const double FX_MAX_USER_MU = 0.100;
+static const double FX_MAX_WEIGHT_STEP_DAC = 0.50;
+static const double FX_NORMALIZATION_EPS = 1.0e-6;
+static const double FX_COMMAND_QUANTUM_DAC = 0.25;
+static const double FX_COMMAND_MAX_ABOVE_MATCH_DAC = 4.0;
+// V1.2: c/d are optional. i surveys a safe range and chooses the BEST coherent
+// moderate-amplitude identification point, not the first point that barely passes.
+static const uint8_t FX_AUTO_PROBE_COUNT = 9;
+static const double FX_AUTO_PROBE_LEVELS[FX_AUTO_PROBE_COUNT] = {
+  5.0, 7.0, 9.0, 11.0, 13.0, 15.0, 17.0, 19.0, 21.0
+};
+static const double FX_AUTO_PROBE_MIN_RESPONSE_MS2 = 0.12;
+static const double FX_AUTO_PROBE_MIN_RESPONSE_FRACTION = 0.40;
+static const double FX_AUTO_PROBE_PREFERRED_RESPONSE_FRACTION = 0.60;
+static const uint8_t FX_AUTO_MAX_CANDIDATES_TO_TRY = 3;
+static const double FX_AUTO_DEFAULT_COMMAND_MAX_DAC = 15.0;
+static const double FX_AUTO_HARD_COMMAND_MAX_DAC = 21.0;
+static const double FX_MIN_ERROR_SYNC = 0.15;
+// Near deep cancellation the selected residual phase naturally becomes noisy.
+// In that region the safe action is to HOLD W, not classify success as a fault.
+static const double FX_LOW_RESIDUAL_FRACTION = 0.25;
+static const double FX_LOW_RESIDUAL_ABS_MS2 = 0.05;
+static const uint8_t FX_MAX_CONSECUTIVE_INVALID = 3;
+// V1.4R CX2: selected-axis protection remains unchanged at 1.50x baseline.
+// Only the VECTOR cross-axis emergency guard is relaxed per the axis-characterization
+// objective: >2.00x baseline means >100% vector amplification (doubling).
+static const double FX_SELECTED_GROWTH_ABORT_FACTOR = 1.50;
+static const double FX_VECTOR_COUPLING_ABORT_FACTOR = 2.00;
+static const uint8_t FX_GROWTH_ABORT_BLOCKS = 3;
+static const uint32_t FX_VALIDATION_DURATION_MS = 10000;
+
+// ============================================================================
+// FXLMS V1.4R - ROBUST FRESH BASELINE + AUTOMATIC 60-S FROZEN PERSISTENCE
+// ============================================================================
+// IMPORTANT: no FxLMS learning law, mu, Wbest qualification, or vector/system
+// selection is changed here. These additions only improve baseline acquisition
+// robustness and extend validation AFTER the existing 10-s frozen confirmation.
+static const uint8_t FX_BASELINE_MAX_ATTEMPTS = 10;
+static const uint16_t FX_BASELINE_STEADY_DELAY_MS = 1000;
+static const uint16_t FX_BASELINE_RETRY_GAP_MS = 40;
+
+static const uint32_t FX_EXTENDED_FREEZE_DURATION_MS = 60000UL;
+static const uint32_t FX_EXTENDED_FREEZE_SEGMENT_MS = 10000UL;
+static const uint8_t FX_EXTENDED_FREEZE_SEGMENTS = 6;
+
+static const uint8_t FX_MIN_ADAPT_SECONDS = 5;
+static const uint8_t FX_MAX_ADAPT_SECONDS = 60;
+
+// ============================================================================
+// FXLMS V1.4 AXIS-CHARACTERIZATION SUPERVISORY SETTINGS
+// ============================================================================
+// These are explicit engineering starting values. They are logged and should be
+// tuned only from repeated experiments; they are not claimed as universal laws.
+static const double FX_V13_FINE_RESIDUAL_RATIO = 0.60;
+static const double FX_V13_HOLD_ENTER_RATIO = 0.30;
+static const double FX_V13_HOLD_EXIT_RATIO = 0.40;
+static const uint8_t FX_V13_HOLD_EXIT_COHERENT_BLOCKS = 4;
+static const uint8_t FX_V13_HOLD_EARLY_VALIDATE_BLOCKS = 12; // ~1.9 s @ 160 ms
+static const double FX_V13_FINE_MU_FACTOR = 0.50;
+
+static const uint8_t FX_V13_ROLLING_BLOCKS = 5;
+// V1.4: Wbest is an AXIS-characterization controller. Vector remains telemetry,
+// not an eligibility gate. 20% selected-axis reduction + 3/5 positive blocks
+// prevents one lucky 160-ms block from being stored as a controller.
+static const double FX_V13_BEST_MIN_SELECTED_REDUCTION_PCT = 20.0;
+static const uint8_t FX_V13_BEST_MIN_POSITIVE_SELECTED_BLOCKS = 3;
+static const double FX_V14_BEST_SELECTED_IMPROVEMENT_EPS_PCT = 0.25;
+
+// V1.4 deliberately removes the former 10%/20% vector performance supervisor.
+// Selected-axis emergency protection remains 1.50x baseline for 3 blocks.
+// Vector is still NOT an optimization gate; only >2.00x baseline for 3 blocks
+// is classified as an extreme cross-axis coupling condition.
+// Absolute sensor/software guards remain unchanged.
+
+// Poor error coherence is held temporarily rather than causing an immediate
+// 0.48-s abort. Reference/sensor/safety failures still have independent aborts.
+static const uint8_t FX_V13_MAX_ERROR_QUALITY_HOLD_BLOCKS = 15; // ~2.4 s
+static const uint8_t FX_V13_MAX_REFERENCE_REJECT_BLOCKS = 5;    // ~0.8 s
+
+// Identification amplitude and live-control authority are deliberately separate.
+static const double FX_V13_AUTHORITY_FACTOR = 1.50;
+static const double FX_V13_CONTROL_CEILING_MIN_DAC = 3.0;
+static const double FX_V13_CONTROL_CEILING_HARD_DAC = 15.0;
+
+// Optional A-B-A-B causal validation after a successful frozen-W run.
+static const uint32_t FX_V13_CAUSAL_OFF_MS = 5000;
+static const uint32_t FX_V13_CAUSAL_ON_MS = 10000;
+
+
+// Phase tracker. A tool/NCO frequency difference larger than this is treated as
+// a bad phase estimate for this narrowband proof test rather than chased.
+static const double TRACK_MAX_ABS_FREQ_ERROR_HZ = 1.50;
+static const double TRACK_FREQ_LPF_ALPHA = 0.35;
+static const double TRACK_ACCEPT_ERROR_DEG = 12.0;
+static const uint8_t TRACK_MAX_CONSECUTIVE_BAD_WINDOWS = 5;
+
+// Automatic tracked sweep: coarse -> fine -> tracked verification.
+static const uint8_t TRACK_COARSE_POINT_COUNT = 12;
+static const double TRACK_COARSE_STEP_DEG = 30.0;
+static const uint8_t TRACK_COARSE_VALID_WINDOWS = 8;
+static const double TRACK_FINE_HALF_RANGE_DEG = 30.0;
+static const double TRACK_FINE_STEP_DEG = 10.0;
+static const uint8_t TRACK_FINE_VALID_WINDOWS = 6;
+static const uint8_t TRACK_FINAL_VALID_WINDOWS = 30; // ~4.8 s of accepted windows
+static const uint8_t TRACK_WARMUP_WINDOWS_PER_POINT = 2;
+static const uint8_t TRACK_EXTRA_ATTEMPTS = 8;
+static const uint16_t TRACK_TOOL_STEADY_DELAY_MS = 1000;
+
+// ============================================================================
+// GLOBAL / STATIC MEMORY - LARGE BUFFERS NEVER LIVE ON TASK STACK
+// ============================================================================
+
+int16_t rawX[FFT_SAMPLES];
+int16_t rawY[FFT_SAMPLES];
+int16_t rawZ[FFT_SAMPLES];
+uint32_t phaseReference[FFT_SAMPLES];
+uint32_t phaseOffsetReference[FFT_SAMPLES]; // V2.0: actual command offset sampled with the NCO
+
+double fftReal[FFT_SAMPLES];
+double fftImag[FFT_SAMPLES];
+double spectrumX[HALF_BINS];
+double spectrumY[HALF_BINS];
+double spectrumZ[HALF_BINS];
+ArduinoFFT<double> FFT(fftReal, fftImag, FFT_SAMPLES, SAMPLE_RATE_HZ);
+
+double slopeHistory[MAX_SLOPE_HISTORY];
+uint8_t slopeCount = 0;
+
+// User settings/state.
+double testFrequencyHz = 268.0;
+double targetAmplitudeMs2 = 1.00;
+ControlAxis controlAxis = ControlAxis::Z_AXIS;
+uint8_t holdSeconds = 8;
+uint8_t independentRuns = 5;
+
+bool automaticTestRunning = false;
+bool emergencyStopRequested = false;
+bool targetAcquired = false;
+StablePoint lockedPoint = {};
+StablePoint lastBracketLow = {};
+StablePoint lastBracketHigh = {};
+
+// V5.1 state. Warm memory is deliberately tiny: one last proven operating
+// point, not a DAC->amplitude calibration curve.
+WarmStartMemory warmStartMemory = {};
+PlantBaseline lockedPlantBaseline = {};
+
+// Fixed serial command buffer avoids String heap fragmentation.
+static const uint8_t COMMAND_BUFFER_SIZE = 96;
+char commandBuffer[COMMAND_BUFFER_SIZE];
+uint8_t commandLength = 0;
+
+// Automatic tests run inside a blocking command. Keep a separate tiny line
+// parser for emergency-stop input so an arbitrary character 's' embedded in
+// unrelated serial text cannot stop the actuator. The intended command is a
+// standalone line: s + Newline (or S + Newline).
+static const uint8_t EMERGENCY_BUFFER_SIZE = 12;
+char emergencyCommandBuffer[EMERGENCY_BUFFER_SIZE];
+uint8_t emergencyCommandLength = 0;
+
+// ============================================================================
+// INTEGRATED NARROWBAND DISCOVERY SETTINGS / STATIC MEMORY
+// ============================================================================
+
+static const double DISC_SEARCH_MIN_HZ = 240.0;
+static const double DISC_SEARCH_MAX_HZ = 320.0;
+static const uint8_t DISC_TOP_CANDIDATES = 5;
+static const uint8_t DISC_PEAK_EXCLUSION_BINS = 3;
+static const double DISC_MIN_FFT_SNR_DB = 8.0;
+static const double DISC_MIN_SIGNAL_AMPLITUDE_MS2 = 0.03;
+static const uint16_t DISC_QUAD_BLOCK_N = 256;
+static const uint8_t DISC_QUAD_BLOCKS = 10;
+static const uint16_t DISC_QUAD_N = DISC_QUAD_BLOCK_N * DISC_QUAD_BLOCKS;
+static const double DISC_FFT_RESOLUTION_HZ = SAMPLE_RATE_HZ / static_cast<double>(FFT_SAMPLES);
+static const double DISC_QUAD_MAX_CORRECTION_HZ = DISC_FFT_RESOLUTION_HZ;
+static const double DISC_QUAD_MAX_PHASE_RMSE_DEG = 35.0;
+
+// --------------------------------------------------------------------------
+// V1.3A DRIFT-TOLERANT ASCII-SAFE QUALITY GATES
+// --------------------------------------------------------------------------
+// The old V1.2 auto-lock required whole-record weighted SyncRatio >= 0.50.
+// Real hand-held records repeatedly showed one obvious 268..273 Hz family but
+// whole-record ratios around 0.3..0.4 because the tool frequency/phase wanders
+// during the ~1.6 s quadrature record.  V1.3 does NOT simply lower that old
+// threshold.  Instead it separates local periodicity from long-record drift:
+//   * local block sync = periodicity over each ~160 ms block
+//   * phase-fit RMSE    = orderly long-record phase/frequency evolution
+//   * FFT consensus     = independent axes/sensors agreeing on the same family
+//   * candidate ratio   = protection against genuinely competing frequencies
+static const double DISC_LOCAL_GOOD_BLOCK_SYNC = 0.20;
+static const double DISC_LOCAL_AXIS_MIN_MEDIAN_SYNC = 0.25;
+static const double DISC_SUPPORT_AXIS_MIN_LOCAL_SYNC = 0.30;
+static const uint8_t DISC_LOCAL_MIN_GOOD_BLOCKS = 5;       // >= 50% of 10 blocks
+static const double DISC_AUTO_LOCK_MIN_WEIGHTED_LOCAL_SYNC = 0.30;
+static const double DISC_AUTO_LOCK_SCORE_RATIO = 1.35;
+static const uint8_t DISC_AUTO_LOCK_MIN_SUPPORT_AXES = 1;
+
+// FFT interpolation is finer than a raw bin, but a tolerance of two raw FFT
+// bins is intentionally used so natural short-term tool drift does not destroy
+// cross-axis consensus.  It is still far narrower than the 240..320 Hz band.
+static const double DISC_FREQ_CONSENSUS_TOL_HZ = 2.0 * DISC_FFT_RESOLUTION_HZ;
+static const uint8_t DISC_MIN_TOOL_FREQ_CONSENSUS_AXES = 1;
+static const uint8_t DISC_MIN_TOTAL_FREQ_CONSENSUS_AXES = 3;
+static const uint32_t DISC_LATE_SAMPLE_WARNING_US = 10;
+static const uint16_t DISC_MAX_ZERO_TRIPLETS_PER_RECORD = 20;
+static const uint8_t DISC_MAX_FRAME_RETRIES = 2;
+
+// First 1024 entries are reused for FFT frames; all 2560 entries are reused for
+// the uninterrupted quadrature record. Large arrays remain global/static.
+int16_t discToolX[DISC_QUAD_N];
+int16_t discToolY[DISC_QUAD_N];
+int16_t discToolZ[DISC_QUAD_N];
+int16_t discHandX[DISC_QUAD_N];
+int16_t discHandY[DISC_QUAD_N];
+int16_t discHandZ[DISC_QUAD_N];
+
+// MEMORY REUSE (V1.3): Stage A discovery and Stage B matcher never need
+// their tool spectra at the same time. Reuse the matcher's three spectrum
+// buffers instead of reserving another 12,288 bytes of DRAM.
+#define discToolSpecX spectrumX
+#define discToolSpecY spectrumY
+#define discToolSpecZ spectrumZ
+
+// ADXL2/hand discovery spectra must coexist with the tool spectra while
+// Stage A is being analysed, so these remain dedicated.
+double discHandSpecX[HALF_BINS];
+double discHandSpecY[HALF_BINS];
+double discHandSpecZ[HALF_BINS];
+
+// MEMORY REUSE (V1.3): after the three FFT frames are accumulated, fftReal
+// is no longer needed as FFT work memory until a later, separate stage. Use
+// its first HALF_BINS entries as the tool vector spectrum. This saves another
+// 4,096 bytes. A hand vector spectrum was never consumed by the algorithm,
+// so the unused 4,096-byte buffer has been removed entirely.
+#define discToolVectorSpectrum fftReal
+
+DiscoveryCandidate discoveryCandidates[DISC_TOP_CANDIDATES];
+uint8_t discoveryCandidateCount = 0;
+DiscoverySensorFFTResult discoveryToolFFT = {};
+DiscoverySensorFFTResult discoveryHandFFT = {};
+DiscoverySensorAtF0 baselineToolAtF0 = {};
+DiscoverySensorAtF0 baselineHandAtF0 = {};
+
+double baselineF0Hz = 0.0;
+bool baselineValid = false;
+bool baselineAxisSelected = false;
+IntegratedWorkflowState integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+double frozenMatchDac = 0.0;
+double frozenMatchMeasuredMs2 = 0.0;
+double lastBestPhaseDeg = 0.0;
+double lastBestPhaseResidualMs2 = 0.0;
+bool lastPhaseSweepValid = false;
+bool quickDacSweepDone = false;
+QuickDacPoint quickDacPoints[QUICK_DAC_POINT_COUNT] = {};
+bool quickAxisReachable[3] = {false, false, false};
+double quickAxisEstimatedDac[3] = {0.0, 0.0, 0.0};
+
+// V2.0 reference-leakage / phase-reference state.
+bool phaseReferenceLeakageValid = false;
+double phaseReferenceLeakageMs2[3] = {0.0, 0.0, 0.0};
+double phaseReferenceLeakRatio[3] = {999.0, 999.0, 999.0};
+uint8_t phaseReferenceAxis = 0;
+bool phaseReferenceAxisValid = false;
+
+// FxLMS state. The secondary path is represented by ONE complex gain at f0.
+bool fxSecondaryPathValid = false;
+double fxSecondaryGainMs2PerDac = 0.0;
+double fxSecondaryPhaseDeg = 0.0;
+FxComplex fxSecondaryPath = {0.0, 0.0};
+double fxProbeDac = 0.0;
+double fxCommandMaxDac = 0.0;
+double fxNormalMu = FX_DEFAULT_NORMAL_MU;
+FxComplex fxLastControllerW = {0.0, 0.0};
+bool fxLastRunValid = false;
+FxBaseline fxLastRunBaseline = {};
+bool fxLastSystemCandidateValid = false;
+double fxLastControlCeilingDac = 0.0;
+
+// V1.4R validation snapshots. The 60-s test is automatically executed only
+// after the existing independent 10-s frozen validation itself qualifies the
+// selected axis (>=20% attenuation). Vector remains diagnostic only.
+FxValidationResult fxLastFrozen10Result = {};
+FxValidationResult fxLastExtended60Result = {};
+bool fxLastExtended60Valid = false;
+
+
+// ============================================================================
+// BASIC HELPERS
+// ============================================================================
+
+double clampDouble(double value, double low, double high) {
+  if (value < low) return low;
+  if (value > high) return high;
+  return value;
+}
+
+double quantizeDac(double value) {
+  value = clampDouble(value, DAC_MIN, DAC_MAX);
+  value = round(value / DAC_QUANTUM) * DAC_QUANTUM;
+  return clampDouble(value, DAC_MIN, DAC_MAX);
+}
+
+double wrapDegrees(double value) {
+  while (value >= 180.0) value -= 360.0;
+  while (value < -180.0) value += 360.0;
+  return value;
+}
+
+double percentDifference(double a, double b) {
+  double denom = 0.5 * (fabs(a) + fabs(b));
+  if (denom < 1.0e-12) return 999.0;
+  return 100.0 * fabs(a - b) / denom;
+}
+
+double targetErrorPercent(double measured) {
+  if (targetAmplitudeMs2 < 1.0e-12) return 999.0;
+  return 100.0 * (measured - targetAmplitudeMs2) / targetAmplitudeMs2;
+}
+
+bool inTargetBand(double measured, double percent) {
+  double f = percent / 100.0;
+  return measured >= targetAmplitudeMs2 * (1.0 - f) &&
+         measured <= targetAmplitudeMs2 * (1.0 + f);
+}
+
+uint8_t axisIndex() {
+  return static_cast<uint8_t>(controlAxis);
+}
+
+char axisChar() {
+  if (controlAxis == ControlAxis::X_AXIS) return 'X';
+  if (controlAxis == ControlAxis::Y_AXIS) return 'Y';
+  return 'Z';
+}
+
+char dominantAxis(double x, double y, double z) {
+  if (x >= y && x >= z) return 'X';
+  if (y >= x && y >= z) return 'Y';
+  return 'Z';
+}
+
+void sortSmall(double *values, uint8_t count) {
+  for (uint8_t i = 1; i < count; i++) {
+    double key = values[i];
+    int j = static_cast<int>(i) - 1;
+    while (j >= 0 && values[j] > key) {
+      values[j + 1] = values[j];
+      j--;
+    }
+    values[j + 1] = key;
+  }
+}
+
+double medianSmall(const double *source, uint8_t count) {
+  if (count == 0) return 0.0;
+  double work[8];
+  if (count > 8) count = 8;
+  for (uint8_t i = 0; i < count; i++) work[i] = source[i];
+  sortSmall(work, count);
+  if (count & 1U) return work[count / 2];
+  return 0.5 * (work[count / 2 - 1] + work[count / 2]);
+}
+
+double meanSmall(const double *values, uint8_t count) {
+  if (count == 0) return 0.0;
+  double sum = 0.0;
+  for (uint8_t i = 0; i < count; i++) sum += values[i];
+  return sum / static_cast<double>(count);
+}
+
+double sampleSdSmall(const double *values, uint8_t count, double mean) {
+  if (count < 2) return 0.0;
+  double ss = 0.0;
+  for (uint8_t i = 0; i < count; i++) {
+    double d = values[i] - mean;
+    ss += d * d;
+  }
+  return sqrt(ss / static_cast<double>(count - 1));
+}
+
+double circularMeanDeg(const double *angles, uint8_t count) {
+  if (count == 0) return 0.0;
+  double c = 0.0, s = 0.0;
+  for (uint8_t i = 0; i < count; i++) {
+    double r = angles[i] * PI / 180.0;
+    c += cos(r);
+    s += sin(r);
+  }
+  return wrapDegrees(atan2(s, c) * 180.0 / PI);
+}
+
+double circularSdDeg(const double *angles, uint8_t count, double meanDeg) {
+  if (count < 2) return 0.0;
+  double diff[8];
+  for (uint8_t i = 0; i < count; i++) diff[i] = wrapDegrees(angles[i] - meanDeg);
+  double m = meanSmall(diff, count);
+  return sampleSdSmall(diff, count, m);
+}
+
+void resetRunningStats(RunningStats &s) {
+  s.n = 0;
+  s.mean = 0.0;
+  s.m2 = 0.0;
+  s.minValue = 1.0e99;
+  s.maxValue = -1.0e99;
+}
+
+void pushRunningStats(RunningStats &s, double value) {
+  s.n++;
+  double delta = value - s.mean;
+  s.mean += delta / static_cast<double>(s.n);
+  double delta2 = value - s.mean;
+  s.m2 += delta * delta2;
+  if (value < s.minValue) s.minValue = value;
+  if (value > s.maxValue) s.maxValue = value;
+}
+
+double runningSd(const RunningStats &s) {
+  if (s.n < 2) return 0.0;
+  return sqrt(s.m2 / static_cast<double>(s.n - 1));
+}
+
+void clearSlopeHistory() {
+  slopeCount = 0;
+  for (uint8_t i = 0; i < MAX_SLOPE_HISTORY; i++) slopeHistory[i] = 0.0;
+}
+
+void pushSlope(double slope) {
+  if (!isfinite(slope) || slope < MIN_VALID_SLOPE || slope > MAX_VALID_SLOPE) return;
+  if (slopeCount < MAX_SLOPE_HISTORY) {
+    slopeHistory[slopeCount++] = slope;
+  } else {
+    for (uint8_t i = 1; i < MAX_SLOPE_HISTORY; i++) slopeHistory[i - 1] = slopeHistory[i];
+    slopeHistory[MAX_SLOPE_HISTORY - 1] = slope;
+  }
+}
+
+double medianSlope() {
+  if (slopeCount == 0) return 0.0;
+  return medianSmall(slopeHistory, slopeCount);
+}
+
+void clearTrialState(ServoState &s) {
+  s.trialPending = false;
+  s.trialValidCount = 0;
+  s.trialAmp[0] = s.trialAmp[1] = 0.0;
+  for (uint8_t a = 0; a < 3; a++) s.trialAxisSum[a] = 0.0;
+  s.trialTotalSum = 0.0;
+  s.trialMaxCvPercent = 0.0;
+}
+
+bool warmStartUsable() {
+  if (!warmStartMemory.valid) return false;
+  if (warmStartMemory.axis != controlAxis) return false;
+  if (fabs(warmStartMemory.frequencyHz - testFrequencyHz) >
+      WARM_START_MAX_FREQUENCY_DELTA_HZ) return false;
+  double targetDeltaPct = 100.0 * fabs(warmStartMemory.targetMs2 - targetAmplitudeMs2) /
+                          fmax(targetAmplitudeMs2, 1.0e-12);
+  return targetDeltaPct <= WARM_START_MAX_TARGET_DELTA_PERCENT;
+}
+
+void rememberWarmStart(double dac) {
+  warmStartMemory.valid = true;
+  warmStartMemory.axis = controlAxis;
+  warmStartMemory.frequencyHz = testFrequencyHz;
+  warmStartMemory.targetMs2 = targetAmplitudeMs2;
+  warmStartMemory.dac = quantizeDac(dac);
+}
+
+void setPlantBaselineFromRecords(PlantBaseline &b, const ControlRecord recs[], uint8_t count) {
+  b = {};
+  if (count == 0) return;
+  double amps[3];
+  double mean = 0.0;
+  for (uint8_t i = 0; i < count; i++) {
+    amps[i] = recs[i].selectedMedianMs2;
+    mean += amps[i];
+    for (uint8_t a = 0; a < 3; a++) b.axisMeanMs2[a] += recs[i].axisMeanMs2[a];
+    b.totalMeanMs2 += recs[i].totalMeanMs2;
+  }
+  mean /= count;
+  for (uint8_t a = 0; a < 3; a++) b.axisMeanMs2[a] /= count;
+  b.totalMeanMs2 /= count;
+  b.valid = true;
+  b.dac = recs[count - 1].dac;
+  b.selectedMs2 = mean;
+  b.selectedCvPercent = count >= 2 && mean > 1.0e-12
+      ? 100.0 * sampleSdSmall(amps, count, mean) / mean : 0.0;
+}
+
+void setPlantBaselineFromTrialAverages(PlantBaseline &b, const ServoState &s, double dac) {
+  b = {};
+  if (s.trialValidCount == 0) return;
+  b.valid = true;
+  b.dac = dac;
+  b.selectedMs2 = (s.trialAmp[0] + s.trialAmp[1]) / s.trialValidCount;
+  for (uint8_t a = 0; a < 3; a++) b.axisMeanMs2[a] = s.trialAxisSum[a] / s.trialValidCount;
+  b.totalMeanMs2 = s.trialTotalSum / s.trialValidCount;
+  double drift = s.trialValidCount >= 2 ? percentDifference(s.trialAmp[0], s.trialAmp[1]) : 0.0;
+  b.selectedCvPercent = drift / sqrt(2.0); // two-point CV proxy, conservative enough for guarding
+}
+
+double plantChangeThresholdPercent(const PlantBaseline &b) {
+  double adaptive = PLANT_CHANGE_CV_GAIN * b.selectedCvPercent +
+                    PLANT_CHANGE_CV_OFFSET_PERCENT;
+  return clampDouble(adaptive, PLANT_CHANGE_MIN_PERCENT, PLANT_CHANGE_MAX_PERCENT);
+}
+
+bool plantStateMismatch(const PlantBaseline &b, const ControlRecord &r, bool printDiag) {
+  if (!b.valid || !r.amplitudeValid) return false;
+  if (fabs(b.dac - r.dac) > 1.0e-9) return false;
+
+  double selectedChange = percentDifference(b.selectedMs2, r.selectedMedianMs2);
+  double threshold = plantChangeThresholdPercent(b);
+  double totalChange = percentDifference(b.totalMeanMs2, r.totalMeanMs2);
+  uint8_t changedAxes = 0;
+  for (uint8_t a = 0; a < 3; a++) {
+    if (b.axisMeanMs2[a] < 0.03 && r.axisMeanMs2[a] < 0.03) continue;
+    if (percentDifference(b.axisMeanMs2[a], r.axisMeanMs2[a]) >=
+        PLANT_VECTOR_CHANGE_PERCENT) changedAxes++;
+  }
+
+  bool vectorEvidence = totalChange >= PLANT_VECTOR_CHANGE_PERCENT || changedAxes >= 2;
+  bool strongSelectedEvidence = selectedChange >= threshold + 4.0;
+  bool mismatch = selectedChange >= threshold && (vectorEvidence || strongSelectedEvidence);
+
+  if (printDiag && selectedChange >= threshold) {
+    Serial.print("PLANT_STATE_CHECK | selected change "); Serial.print(selectedChange, 2);
+    Serial.print(" % | adaptive threshold "); Serial.print(threshold, 2);
+    Serial.print(" % | vector change "); Serial.print(totalChange, 2);
+    Serial.print(" % | changed axes "); Serial.println(changedAxes);
+  }
+  return mismatch;
+}
+
+const char *phaseClassText(PhaseClass p) {
+  if (p == PhaseClass::STRONG) return "STRONG";
+  if (p == PhaseClass::MODERATE) return "MODERATE";
+  return "WEAK";
+}
+
+// ============================================================================
+// ADXL345 SPI
+// ============================================================================
+
+void writeRegister(uint8_t reg, uint8_t value) {
+  SPI.beginTransaction(adxlSpiSettings);
+  digitalWrite(PIN_CS_ADXL2, LOW);
+  SPI.transfer(reg & 0x3F);
+  SPI.transfer(value);
+  digitalWrite(PIN_CS_ADXL2, HIGH);
+  SPI.endTransaction();
+}
+
+uint8_t readRegister(uint8_t reg) {
+  SPI.beginTransaction(adxlSpiSettings);
+  digitalWrite(PIN_CS_ADXL2, LOW);
+  SPI.transfer(SPI_READ_BIT | (reg & 0x3F));
+  uint8_t value = SPI.transfer(0x00);
+  digitalWrite(PIN_CS_ADXL2, HIGH);
+  SPI.endTransaction();
+  return value;
+}
+
+RawAcceleration readRawXYZ() {
+  RawAcceleration r = {};
+  SPI.beginTransaction(adxlSpiSettings);
+  digitalWrite(PIN_CS_ADXL2, LOW);
+  SPI.transfer(SPI_READ_BIT | SPI_MB_BIT | (REG_DATAX0 & 0x3F));
+  uint8_t x0 = SPI.transfer(0), x1 = SPI.transfer(0);
+  uint8_t y0 = SPI.transfer(0), y1 = SPI.transfer(0);
+  uint8_t z0 = SPI.transfer(0), z1 = SPI.transfer(0);
+  digitalWrite(PIN_CS_ADXL2, HIGH);
+  SPI.endTransaction();
+  r.x = static_cast<int16_t>((static_cast<uint16_t>(x1) << 8) | x0);
+  r.y = static_cast<int16_t>((static_cast<uint16_t>(y1) << 8) | y0);
+  r.z = static_cast<int16_t>((static_cast<uint16_t>(z1) << 8) | z0);
+  return r;
+}
+
+bool verifyAdxl2(bool printDetails) {
+  uint8_t devid = readRegister(REG_DEVID);
+  uint8_t format = readRegister(REG_DATA_FORMAT);
+  uint8_t rate = readRegister(REG_BW_RATE);
+  uint8_t power = readRegister(REG_POWER_CTL);
+
+  bool ok = devid == ADXL_DEVID_OK &&
+            ((format & 0x0F) == 0x0B) &&
+            ((rate & 0x1F) == 0x0E) &&
+            ((power & 0x08) != 0);
+
+  if (printDetails || !ok) {
+    Serial.print("ADXL2 DEVID=0x"); Serial.print(devid, HEX);
+    Serial.print(" DATA_FORMAT=0x"); Serial.print(format, HEX);
+    Serial.print(" BW_RATE=0x"); Serial.print(rate, HEX);
+    Serial.print(" POWER_CTL=0x"); Serial.println(power, HEX);
+  }
+  return ok;
+}
+
+bool initializeAdxl2() {
+  writeRegister(REG_POWER_CTL, 0x00);
+  delay(10);
+  if (readRegister(REG_DEVID) != ADXL_DEVID_OK) return false;
+  writeRegister(REG_DATA_FORMAT, 0x0B); // FULL_RES, +/-16 g, 4-wire SPI
+  writeRegister(REG_BW_RATE, 0x0E);     // 1600 Hz ODR
+  writeRegister(REG_POWER_CTL, 0x08);   // measurement mode
+  delay(30);
+  return verifyAdxl2(true);
+}
+
+
+// Generic shared-SPI helpers used only by the integrated dual-ADXL discovery.
+// The frozen V5.1R matcher continues to use its original ADXL2-only functions.
+void deselectBothAdxl() {
+  digitalWrite(PIN_CS_ADXL1, HIGH);
+  digitalWrite(PIN_CS_ADXL2, HIGH);
+}
+
+void dualWriteRegister(uint8_t csPin, uint8_t reg, uint8_t value) {
+  SPI.beginTransaction(adxlSpiSettings);
+  deselectBothAdxl();
+  digitalWrite(csPin, LOW);
+  SPI.transfer(reg & 0x3F);
+  SPI.transfer(value);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+}
+
+uint8_t dualReadRegister(uint8_t csPin, uint8_t reg) {
+  SPI.beginTransaction(adxlSpiSettings);
+  deselectBothAdxl();
+  digitalWrite(csPin, LOW);
+  SPI.transfer(SPI_READ_BIT | (reg & 0x3F));
+  uint8_t value = SPI.transfer(0x00);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+  return value;
+}
+
+RawAcceleration dualReadRawXYZ(uint8_t csPin) {
+  RawAcceleration r = {};
+  SPI.beginTransaction(adxlSpiSettings);
+  deselectBothAdxl();
+  digitalWrite(csPin, LOW);
+  SPI.transfer(SPI_READ_BIT | SPI_MB_BIT | (REG_DATAX0 & 0x3F));
+  uint8_t x0 = SPI.transfer(0x00), x1 = SPI.transfer(0x00);
+  uint8_t y0 = SPI.transfer(0x00), y1 = SPI.transfer(0x00);
+  uint8_t z0 = SPI.transfer(0x00), z1 = SPI.transfer(0x00);
+  digitalWrite(csPin, HIGH);
+  SPI.endTransaction();
+  r.x = static_cast<int16_t>((static_cast<uint16_t>(x1) << 8) | x0);
+  r.y = static_cast<int16_t>((static_cast<uint16_t>(y1) << 8) | y0);
+  r.z = static_cast<int16_t>((static_cast<uint16_t>(z1) << 8) | z0);
+  return r;
+}
+
+bool verifyReferenceAdxl1(bool printDetails) {
+  uint8_t devid = dualReadRegister(PIN_CS_ADXL1, REG_DEVID);
+  uint8_t format = dualReadRegister(PIN_CS_ADXL1, REG_DATA_FORMAT);
+  uint8_t rate = dualReadRegister(PIN_CS_ADXL1, REG_BW_RATE);
+  uint8_t power = dualReadRegister(PIN_CS_ADXL1, REG_POWER_CTL);
+  bool ok = devid == ADXL_DEVID_OK &&
+            ((format & 0x0F) == 0x0B) &&
+            ((rate & 0x1F) == 0x0E) &&
+            ((power & 0x08) != 0);
+  if (printDetails || !ok) {
+    Serial.print("ADXL1 DEVID=0x"); Serial.print(devid, HEX);
+    Serial.print(" DATA_FORMAT=0x"); Serial.print(format, HEX);
+    Serial.print(" BW_RATE=0x"); Serial.print(rate, HEX);
+    Serial.print(" POWER_CTL=0x"); Serial.println(power, HEX);
+  }
+  return ok;
+}
+
+bool initializeReferenceAdxl1() {
+  dualWriteRegister(PIN_CS_ADXL1, REG_POWER_CTL, 0x00);
+  delay(10);
+  if (dualReadRegister(PIN_CS_ADXL1, REG_DEVID) != ADXL_DEVID_OK) return false;
+  dualWriteRegister(PIN_CS_ADXL1, REG_DATA_FORMAT, 0x0B);
+  dualWriteRegister(PIN_CS_ADXL1, REG_BW_RATE, 0x0E);
+  dualWriteRegister(PIN_CS_ADXL1, REG_POWER_CTL, 0x08);
+  delay(30);
+  return verifyReferenceAdxl1(true);
+}
+
+bool verifyBothIntegratedSensorsOrRecover() {
+  bool a = verifyReferenceAdxl1(false);
+  bool b = verifyAdxl2(false);
+  if (a && b) return true;
+  Serial.println("SENSOR_DATA_INTEGRITY_WARNING: ADXL register/configuration verification failed.");
+  Serial.println("This is a sensor/SPI integrity condition, NOT an FxLMS adaptation failure.");
+  Serial.println("Reinitializing both sensors once before invalidating the measurement stage...");
+  a = initializeReferenceAdxl1();
+  b = initializeAdxl2();
+  if (!(a && b)) {
+    Serial.println("SENSOR_IO_FAILURE: ADXL verification still invalid after one reinitialization attempt.");
+    Serial.println("VISATON/control data from this condition must not be interpreted as an FxLMS performance result.");
+  }
+  return a && b;
+}
+
+// ============================================================================
+// PHASE-CONTINUOUS HARDWARE-TIMER NCO
+// ============================================================================
+
+void buildSineTable(uint8_t bank, double dacAmplitude) {
+  // V5.1R callers still pass quantized DAC >= 3.0. FxLMS additionally needs
+  // a true zero-amplitude table while keeping the phase accumulator alive.
+  dacAmplitude = clampDouble(dacAmplitude, 0.0, DAC_MAX);
+  for (uint16_t i = 0; i < 256; i++) {
+    double theta = 2.0 * PI * static_cast<double>(i) / 256.0;
+    int code = 128 + static_cast<int>(lround(dacAmplitude * sin(theta)));
+    code = constrain(code, 0, 255);
+    visatonSineTable[bank][i] = static_cast<uint8_t>(code);
+  }
+}
+
+void ARDUINO_ISR_ATTR visatonTimerISR() {
+  if (!visatonRunning) return;
+
+  uint32_t previous = visatonPhaseAccumulator;
+  uint32_t next = previous + visatonPhaseIncrement;
+  visatonPhaseAccumulator = next;
+
+  // Only switch amplitude at phase wrap, near sine zero.
+  if (amplitudeTablePending && next < previous) {
+    activeSineTable = pendingSineTable;
+    amplitudeTablePending = false;
+  }
+
+  // Slew phase offset along the shortest circular direction. This avoids a
+  // full-size instantaneous waveform jump when the phase sweep changes target.
+  int32_t phaseDiff = static_cast<int32_t>(visatonPhaseOffsetTarget -
+                                           visatonPhaseOffsetCurrent);
+  if (phaseDiff > static_cast<int32_t>(PHASE_SLEW_WORD_PER_ISR)) {
+    visatonPhaseOffsetCurrent += PHASE_SLEW_WORD_PER_ISR;
+  } else if (phaseDiff < -static_cast<int32_t>(PHASE_SLEW_WORD_PER_ISR)) {
+    visatonPhaseOffsetCurrent -= PHASE_SLEW_WORD_PER_ISR;
+  } else {
+    visatonPhaseOffsetCurrent = visatonPhaseOffsetTarget;
+  }
+
+  uint32_t commandPhase = next + visatonPhaseOffsetCurrent;
+  uint8_t index = static_cast<uint8_t>(commandPhase >> 24);
+  dacWrite(PIN_VISATON_DAC, visatonSineTable[activeSineTable][index]);
+}
+
+bool initializeVisatonTimer() {
+  visatonTimer = timerBegin(TIMER_BASE_FREQUENCY_HZ);
+  if (visatonTimer == nullptr) return false;
+  timerAttachInterrupt(visatonTimer, &visatonTimerISR);
+  timerAlarm(visatonTimer, TIMER_ALARM_TICKS, true, 0);
+  return true;
+}
+
+double actualNcoFrequencyHz() {
+  return static_cast<double>(visatonPhaseIncrement) *
+         static_cast<double>(DAC_UPDATE_RATE_HZ) / 4294967296.0;
+}
+
+bool startVisatonInitial(double frequencyHz, double dacAmplitude) {
+  frequencyHz = clampDouble(frequencyHz, COMMAND_MIN_HZ, COMMAND_MAX_HZ);
+  dacAmplitude = quantizeDac(dacAmplitude);
+
+  visatonRunning = false;
+  amplitudeTablePending = false;
+  activeSineTable = 0;
+  pendingSineTable = 1;
+  buildSineTable(0, dacAmplitude);
+  buildSineTable(1, dacAmplitude);
+
+  visatonPhaseAccumulator = 0;
+  visatonPhaseOffsetCurrent = 0;
+  visatonPhaseOffsetTarget = 0;
+  visatonPhaseIncrement = static_cast<uint32_t>(
+      frequencyHz * 4294967296.0 / static_cast<double>(DAC_UPDATE_RATE_HZ));
+  currentCommandFrequencyHz = frequencyHz;
+  currentDacAmplitude = dacAmplitude;
+  dacWrite(PIN_VISATON_DAC, 128);
+  visatonRunning = true;
+  return true;
+}
+
+bool checkEmergencyStop();
+
+bool waitForPendingAmplitude(uint32_t timeoutMs) {
+  uint32_t start = millis();
+  while (amplitudeTablePending) {
+    if (checkEmergencyStop()) return false;
+    if (millis() - start > timeoutMs) return false;
+    delay(1);
+  }
+  return true;
+}
+
+bool setVisatonAmplitudeContinuous(double dacAmplitude) {
+  dacAmplitude = quantizeDac(dacAmplitude);
+
+  if (!visatonRunning || fabs(currentCommandFrequencyHz - testFrequencyHz) > 1.0e-9) {
+    return startVisatonInitial(testFrequencyHz, dacAmplitude);
+  }
+
+  if (fabs(dacAmplitude - currentDacAmplitude) < 1.0e-9) return true;
+
+  if (!waitForPendingAmplitude(200)) return false;
+  uint8_t inactive = static_cast<uint8_t>(1U - activeSineTable);
+  buildSineTable(inactive, dacAmplitude);
+  pendingSineTable = inactive;
+  amplitudeTablePending = true;
+
+  // At 20 Hz one wrap is <=50 ms; 180 ms is generous.
+  if (!waitForPendingAmplitude(180)) return false;
+  currentDacAmplitude = dacAmplitude;
+  return true;
+}
+
+// FxLMS-specific command helpers. They deliberately allow amplitude = 0 while
+// preserving the same 10 kHz phase-continuous NCO and double-buffered table
+// architecture used by V5.1R. The validated matcher functions above are not
+// changed and still enforce DAC_MIN = 3.
+double quantizeFxCommandAmplitude(double value) {
+  value = clampDouble(value, 0.0, DAC_MAX);
+  value = round(value / FX_COMMAND_QUANTUM_DAC) * FX_COMMAND_QUANTUM_DAC;
+  return clampDouble(value, 0.0, DAC_MAX);
+}
+
+bool startVisatonFxInitial(double frequencyHz, double dacAmplitude) {
+  frequencyHz = clampDouble(frequencyHz, COMMAND_MIN_HZ, COMMAND_MAX_HZ);
+  dacAmplitude = quantizeFxCommandAmplitude(dacAmplitude);
+
+  visatonRunning = false;
+  amplitudeTablePending = false;
+  activeSineTable = 0;
+  pendingSineTable = 1;
+  buildSineTable(0, dacAmplitude);
+  buildSineTable(1, dacAmplitude);
+
+  visatonPhaseAccumulator = 0;
+  visatonPhaseIncrement = static_cast<uint32_t>(
+      frequencyHz * 4294967296.0 / static_cast<double>(DAC_UPDATE_RATE_HZ));
+  visatonPhaseOffsetCurrent = 0;
+  visatonPhaseOffsetTarget = 0;
+  currentCommandFrequencyHz = frequencyHz;
+  currentDacAmplitude = dacAmplitude;
+  dacWrite(PIN_VISATON_DAC, 128);
+  visatonRunning = true;
+  return true;
+}
+
+bool setVisatonFxAmplitudeContinuous(double dacAmplitude) {
+  dacAmplitude = quantizeFxCommandAmplitude(dacAmplitude);
+  if (!visatonRunning || fabs(currentCommandFrequencyHz - testFrequencyHz) > 1.0e-9) {
+    return startVisatonFxInitial(testFrequencyHz, dacAmplitude);
+  }
+  if (fabs(dacAmplitude - currentDacAmplitude) < 1.0e-9) return true;
+  if (!waitForPendingAmplitude(200)) return false;
+  uint8_t inactive = static_cast<uint8_t>(1U - activeSineTable);
+  buildSineTable(inactive, dacAmplitude);
+  pendingSineTable = inactive;
+  amplitudeTablePending = true;
+  if (!waitForPendingAmplitude(180)) return false;
+  currentDacAmplitude = dacAmplitude;
+  return true;
+}
+
+
+void stopVisaton() {
+  visatonRunning = false;
+  amplitudeTablePending = false;
+  visatonPhaseAccumulator = 0;
+  visatonPhaseIncrement = 0;
+  visatonPhaseOffsetCurrent = 0;
+  visatonPhaseOffsetTarget = 0;
+  currentDacAmplitude = 0.0;
+  currentCommandFrequencyHz = 0.0;
+  dacWrite(PIN_VISATON_DAC, 128);
+}
+
+uint32_t phaseDegreesToWord(double degrees) {
+  while (degrees >= 360.0) degrees -= 360.0;
+  while (degrees < 0.0) degrees += 360.0;
+  return static_cast<uint32_t>(degrees * 4294967296.0 / 360.0);
+}
+
+double phaseWordToDegreesSigned(uint32_t word) {
+  double degrees = static_cast<double>(word) * 360.0 / 4294967296.0;
+  return wrapDegrees(degrees);
+}
+
+double getCurrentVisatonPhaseOffsetDeg() {
+  noInterrupts();
+  uint32_t word = visatonPhaseOffsetCurrent;
+  interrupts();
+  return phaseWordToDegreesSigned(word);
+}
+
+void setVisatonPhaseOffsetTargetDeg(double degrees) {
+  uint32_t word = phaseDegreesToWord(degrees);
+  noInterrupts();
+  visatonPhaseOffsetTarget = word;
+  interrupts();
+}
+
+bool waitForPhaseOffsetSettled(uint32_t timeoutMs, double toleranceDeg) {
+  uint32_t startMs = millis();
+  while (millis() - startMs < timeoutMs) {
+    if (checkEmergencyStop()) return false;
+    noInterrupts();
+    uint32_t current = visatonPhaseOffsetCurrent;
+    uint32_t target = visatonPhaseOffsetTarget;
+    interrupts();
+    double errorDeg = fabs(static_cast<double>(static_cast<int32_t>(target - current)) *
+                           360.0 / 4294967296.0);
+    if (errorDeg <= toleranceDeg) return true;
+    delay(1);
+  }
+  return false;
+}
+
+bool setVisatonFrequencyContinuous(double frequencyHz) {
+  if (!visatonRunning) return false;
+  frequencyHz = clampDouble(frequencyHz, COMMAND_MIN_HZ, COMMAND_MAX_HZ);
+  uint32_t increment = static_cast<uint32_t>(
+      frequencyHz * 4294967296.0 / static_cast<double>(DAC_UPDATE_RATE_HZ));
+  noInterrupts();
+  visatonPhaseIncrement = increment;
+  interrupts();
+  currentCommandFrequencyHz = frequencyHz;
+  return true;
+}
+
+// ============================================================================
+// EMERGENCY STOP / SETTLING
+// ============================================================================
+
+bool checkEmergencyStop() {
+  if (emergencyStopRequested) return true;
+  if (!automaticTestRunning) return false;
+
+  bool stopSeen = false;
+  while (Serial.available()) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      emergencyCommandBuffer[emergencyCommandLength] = '\0';
+
+      // Trim surrounding spaces/tabs and require the ENTIRE command to be s/S.
+      char *p = emergencyCommandBuffer;
+      while (*p == ' ' || *p == '\t') p++;
+      char *tail = p + strlen(p);
+      while (tail > p && (tail[-1] == ' ' || tail[-1] == '\t')) *--tail = '\0';
+
+      if ((p[0] == 's' || p[0] == 'S') && p[1] == '\0') stopSeen = true;
+      emergencyCommandLength = 0;
+      emergencyCommandBuffer[0] = '\0';
+    } else if (emergencyCommandLength + 1 < EMERGENCY_BUFFER_SIZE) {
+      emergencyCommandBuffer[emergencyCommandLength++] = c;
+    } else {
+      // Overflow means this is not a valid emergency line; discard safely.
+      emergencyCommandLength = 0;
+      emergencyCommandBuffer[0] = '\0';
+    }
+  }
+
+  if (stopSeen) {
+    emergencyStopRequested = true;
+    stopVisaton();
+    Serial.println("\nEMERGENCY STOP - VISATON OFF.");
+    return true;
+  }
+  return false;
+}
+
+bool interruptibleDelay(uint32_t durationMs) {
+  uint32_t start = millis();
+  while (millis() - start < durationMs) {
+    if (checkEmergencyStop()) return false;
+    delay(2);
+  }
+  return true;
+}
+
+uint16_t adaptiveSettleMs(double oldDac, double newDac) {
+  double commandPart = SETTLE_BASE_MS + SETTLE_PER_DAC_MS * fabs(newDac - oldDac);
+  double cyclePart = SETTLE_MIN_CYCLES * 1000.0 / fmax(testFrequencyHz, 1.0);
+  return static_cast<uint16_t>(clampDouble(fmax(commandPart, cyclePart),
+                                           SETTLE_BASE_MS, SETTLE_MAX_MS));
+}
+
+// ============================================================================
+// EXACT-COMMAND-FREQUENCY NCO-REFERENCED I/Q
+// ============================================================================
+
+void calculateSyncAxis(const int16_t samples[], const uint32_t phaseRef[],
+                       uint16_t sampleCount, AxisSyncResult &result) {
+  result = {};
+  if (sampleCount < 32) return;
+
+  double meanRaw = 0.0;
+  for (uint16_t i = 0; i < sampleCount; i++) meanRaw += samples[i];
+  meanRaw /= static_cast<double>(sampleCount);
+
+  double I = 0.0;
+  double Q = 0.0;
+  double windowSum = 0.0;
+  double acSq = 0.0;
+  const double PHASE_TO_RAD = 2.0 * PI / 4294967296.0;
+
+  for (uint16_t i = 0; i < sampleCount; i++) {
+    double value = (static_cast<double>(samples[i]) - meanRaw) * ADXL_MS2_PER_LSB;
+    double w = 0.5 - 0.5 * cos(2.0 * PI * static_cast<double>(i) /
+                                static_cast<double>(sampleCount - 1));
+    double theta = static_cast<double>(phaseRef[i]) * PHASE_TO_RAD;
+    I += value * w * cos(theta);
+    Q += value * w * sin(theta);
+    windowSum += w;
+    acSq += value * value;
+  }
+
+  if (windowSum <= 0.0) return;
+
+  result.amplitudeMs2 = 2.0 * sqrt(I * I + Q * Q) / windowSum;
+
+  // Reference convention:
+  // generated command = sin(theta)
+  // measured = A*sin(theta + phi)
+  // therefore I ~ sin(phi), Q ~ cos(phi), so phi = atan2(I,Q).
+  result.phaseDeg = wrapDegrees(atan2(I, Q) * 180.0 / PI);
+
+  double acRms = sqrt(acSq / static_cast<double>(sampleCount));
+  double fittedRms = result.amplitudeMs2 / sqrt(2.0);
+  result.syncRatio = acRms > 1.0e-12 ? fittedRms / acRms : 0.0;
+  result.syncRatio = clampDouble(result.syncRatio, 0.0, 1.0);
+}
+
+WindowResult acquireWindow(uint16_t sampleCount) {
+  WindowResult result = {};
+  if (sampleCount < 32 || sampleCount > FFT_SAMPLES) return result;
+
+  if (!verifyAdxl2(false)) {
+    result.communicationFault = true;
+    return result;
+  }
+
+  uint32_t nextSampleUs = micros();
+  RawAcceleration previous = {};
+  bool havePrevious = false;
+  uint16_t stagnantRun = 0;
+
+  for (uint16_t i = 0; i < sampleCount; i++) {
+    while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {}
+    uint32_t actualUs = micros();
+    uint32_t lateness = actualUs - nextSampleUs;
+    if (lateness > result.maxLatenessUs) result.maxLatenessUs = lateness;
+    if (lateness > LATE_SAMPLE_WARNING_US) result.lateSamples++;
+    nextSampleUs += SAMPLE_PERIOD_US;
+
+    phaseReference[i] = visatonPhaseAccumulator;
+    RawAcceleration raw = readRawXYZ();
+    rawX[i] = raw.x;
+    rawY[i] = raw.y;
+    rawZ[i] = raw.z;
+
+    if (raw.x == 0 && raw.y == 0 && raw.z == 0) result.zeroTriplets++;
+
+    if (abs(static_cast<int>(raw.x)) >= ADXL_RAW_CLIP_LIMIT ||
+        abs(static_cast<int>(raw.y)) >= ADXL_RAW_CLIP_LIMIT ||
+        abs(static_cast<int>(raw.z)) >= ADXL_RAW_CLIP_LIMIT) {
+      result.rawClipped = true;
+    }
+
+    if (havePrevious && raw.x == previous.x && raw.y == previous.y && raw.z == previous.z) {
+      stagnantRun++;
+      if (stagnantRun > result.longestStagnantRun) result.longestStagnantRun = stagnantRun;
+    } else {
+      stagnantRun = 0;
+    }
+
+    previous = raw;
+    havePrevious = true;
+  }
+
+  if (!verifyAdxl2(false) ||
+      result.zeroTriplets > MAX_ZERO_TRIPLETS ||
+      result.longestStagnantRun > MAX_STAGNANT_RUN) {
+    result.communicationFault = true;
+  }
+
+  result.timingFault = result.lateSamples > MAX_LATE_SAMPLES_PER_WINDOW;
+
+  calculateSyncAxis(rawX, phaseReference, sampleCount, result.axis[0]);
+  calculateSyncAxis(rawY, phaseReference, sampleCount, result.axis[1]);
+  calculateSyncAxis(rawZ, phaseReference, sampleCount, result.axis[2]);
+
+  result.totalAmplitudeMs2 = sqrt(
+      result.axis[0].amplitudeMs2 * result.axis[0].amplitudeMs2 +
+      result.axis[1].amplitudeMs2 * result.axis[1].amplitudeMs2 +
+      result.axis[2].amplitudeMs2 * result.axis[2].amplitudeMs2);
+
+  result.valid = !result.communicationFault && !result.rawClipped && !result.timingFault;
+  return result;
+}
+
+ControlRecord measureControlRecord(double dac, bool settleIfChanged) {
+  ControlRecord result = {};
+  result.measured = true;
+  result.dac = quantizeDac(dac);
+
+  if (!verifyAdxl2(false)) {
+    result.communicationFault = true;
+    return result;
+  }
+
+  double oldDac = currentDacAmplitude;
+  bool commandChanged = !visatonRunning ||
+                        fabs(currentCommandFrequencyHz - testFrequencyHz) > 1.0e-9 ||
+                        fabs(currentDacAmplitude - result.dac) > 1.0e-9;
+
+  if (commandChanged) {
+    if (!setVisatonAmplitudeContinuous(result.dac)) return result;
+    if (settleIfChanged && !interruptibleDelay(adaptiveSettleMs(oldDac, result.dac))) return result;
+  }
+
+  WindowResult windows[CONTROL_WINDOWS];
+  uint8_t validIndex[CONTROL_WINDOWS];
+  double selected[CONTROL_WINDOWS];
+  uint8_t validCount = 0;
+
+  for (uint8_t w = 0; w < CONTROL_WINDOWS; w++) {
+    windows[w] = acquireWindow(CONTROL_SAMPLES);
+    result.windowValid[w] = windows[w].valid;
+    result.windowSelectedMs2[w] = windows[w].axis[axisIndex()].amplitudeMs2;
+
+    if (windows[w].communicationFault) result.communicationFault = true;
+    if (windows[w].rawClipped) result.rawClipped = true;
+    if (windows[w].timingFault) result.timingRejected = true;
+
+    for (uint8_t a = 0; a < 3; a++) {
+      if (windows[w].axis[a].amplitudeMs2 > AXIS_SOFTWARE_GUARD_MS2) result.safetyExceeded = true;
+    }
+    if (windows[w].totalAmplitudeMs2 > TOTAL_SOFTWARE_GUARD_MS2) result.safetyExceeded = true;
+
+    if (result.safetyExceeded) {
+      stopVisaton();
+      return result;
+    }
+
+    if (windows[w].valid) {
+      validIndex[validCount] = w;
+      selected[validCount] = windows[w].axis[axisIndex()].amplitudeMs2;
+      validCount++;
+    }
+
+    if (w + 1 < CONTROL_WINDOWS && !interruptibleDelay(WINDOW_GAP_MS)) return result;
+  }
+
+  result.validWindows = validCount;
+  if (validCount < CONTROL_MIN_INLIERS) return result;
+
+  result.selectedMedianMs2 = medianSmall(selected, validCount);
+  if (result.selectedMedianMs2 < MIN_REPORT_AMPLITUDE_MS2) return result;
+
+  double deviation[CONTROL_WINDOWS];
+  for (uint8_t i = 0; i < validCount; i++) deviation[i] = fabs(selected[i] - result.selectedMedianMs2);
+  double mad = medianSmall(deviation, validCount);
+  result.madPercent = 100.0 * 1.4826 * mad / fmax(result.selectedMedianMs2, 1.0e-12);
+
+  double acceptedSelected[CONTROL_WINDOWS];
+  double phaseByAxis[3][CONTROL_WINDOWS];
+  double sumAxis[3] = {0.0, 0.0, 0.0};
+  double sumSync[3] = {0.0, 0.0, 0.0};
+  double sumTotal = 0.0;
+  uint8_t inliers = 0;
+
+  for (uint8_t i = 0; i < validCount; i++) {
+    double diffPct = 100.0 * fabs(selected[i] - result.selectedMedianMs2) /
+                     fmax(result.selectedMedianMs2, 1.0e-12);
+    if (diffPct > WINDOW_OUTLIER_PERCENT) continue;
+
+    uint8_t idx = validIndex[i];
+    acceptedSelected[inliers] = selected[i];
+    for (uint8_t a = 0; a < 3; a++) {
+      sumAxis[a] += windows[idx].axis[a].amplitudeMs2;
+      sumSync[a] += windows[idx].axis[a].syncRatio;
+      phaseByAxis[a][inliers] = windows[idx].axis[a].phaseDeg;
+    }
+    sumTotal += windows[idx].totalAmplitudeMs2;
+    inliers++;
+  }
+
+  result.inlierCount = inliers;
+  if (inliers < CONTROL_MIN_INLIERS) return result;
+
+  result.selectedMeanMs2 = meanSmall(acceptedSelected, inliers);
+  result.cvPercent = result.selectedMeanMs2 > 1.0e-12
+      ? 100.0 * sampleSdSmall(acceptedSelected, inliers, result.selectedMeanMs2) /
+        result.selectedMeanMs2
+      : 999.0;
+
+  for (uint8_t a = 0; a < 3; a++) {
+    result.axisMeanMs2[a] = sumAxis[a] / inliers;
+    result.axisSync[a] = sumSync[a] / inliers;
+    result.axisPhaseDeg[a] = circularMeanDeg(phaseByAxis[a], inliers);
+  }
+
+  result.totalMeanMs2 = sumTotal / inliers;
+  uint8_t selectedAxis = axisIndex();
+  result.selectedPhaseSdDeg = circularSdDeg(phaseByAxis[selectedAxis], inliers,
+                                            result.axisPhaseDeg[selectedAxis]);
+  result.timestampMs = millis();
+
+  // SyncRatio intentionally excluded from amplitude validity.
+  result.amplitudeValid = !result.communicationFault && !result.rawClipped &&
+                          !result.safetyExceeded &&
+                          result.selectedMedianMs2 >= MIN_REPORT_AMPLITUDE_MS2 &&
+                          result.madPercent <= RECORD_MAX_MAD_PERCENT &&
+                          result.cvPercent <= RECORD_MAX_CV_PERCENT;
+
+  result.phaseReadyStrong = result.amplitudeValid &&
+                            result.axisSync[selectedAxis] >= PHASE_STRONG_MIN_SYNC &&
+                            result.selectedPhaseSdDeg <= PHASE_STRONG_MAX_RECORD_SD_DEG;
+  return result;
+}
+
+void printControlRecord(const char *label, uint16_t index, const ControlRecord &r) {
+  bool haveAggregate = r.inlierCount >= CONTROL_MIN_INLIERS &&
+                       r.selectedMedianMs2 >= MIN_REPORT_AMPLITUDE_MS2;
+
+  Serial.print(label); Serial.print(" #"); Serial.print(index);
+  Serial.print(" | DAC "); Serial.print(r.dac, 2);
+  Serial.print(" | CTRL "); Serial.print(axisChar()); Serial.print(" ");
+
+  if (haveAggregate) {
+    Serial.print(r.selectedMedianMs2, 5);
+    Serial.print(" | err "); Serial.print(targetErrorPercent(r.selectedMedianMs2), 2); Serial.print(" %");
+    Serial.print(" | X/Y/Z ");
+    Serial.print(r.axisMeanMs2[0], 5); Serial.print(" / ");
+    Serial.print(r.axisMeanMs2[1], 5); Serial.print(" / ");
+    Serial.print(r.axisMeanMs2[2], 5);
+    Serial.print(" | CV "); Serial.print(r.cvPercent, 2);
+    Serial.print(" | MAD "); Serial.print(r.madPercent, 2);
+  } else {
+    // A rejected/unavailable estimate is NOT a physical zero.
+    Serial.print("N/A | err N/A | X/Y/Z N/A / N/A / N/A | CV N/A | MAD N/A");
+  }
+
+  Serial.print(" | inliers "); Serial.print(r.inlierCount);
+
+  if (r.safetyExceeded) Serial.println(" | SAFETY_STOP");
+  else if (r.communicationFault) Serial.println(" | SPI/STALE_DATA_FAULT");
+  else if (r.rawClipped) Serial.println(" | RAW_CLIPPING");
+  else if (!r.amplitudeValid) Serial.println(" | AMPLITUDE_QUALITY_REJECT");
+  else if (inTargetBand(r.selectedMedianMs2, PREFERRED_BAND_PERCENT)) Serial.println(" | PREFERRED");
+  else if (inTargetBand(r.selectedMedianMs2, ACCEPTED_BAND_PERCENT)) Serial.println(" | ACCEPTED");
+  else Serial.println(" | VALID");
+
+  // Only print per-window detail when the canonical record was rejected. This
+  // preserves V4's 3x512 estimator while making rejection causes observable.
+  if (!r.amplitudeValid) {
+    Serial.print("  WINDOW_DIAG ");
+    for (uint8_t w = 0; w < CONTROL_WINDOWS; w++) {
+      Serial.print("W"); Serial.print(w + 1); Serial.print("=");
+      if (r.windowValid[w]) Serial.print(r.windowSelectedMs2[w], 5);
+      else Serial.print("N/A");
+      if (w + 1 < CONTROL_WINDOWS) Serial.print(" | ");
+    }
+    Serial.println();
+  }
+}
+
+// ============================================================================
+// SAME-DAC STABLE POINT
+// ============================================================================
+
+StablePoint aggregateStablePair(const ControlRecord &a, const ControlRecord &b, double driftPct) {
+  StablePoint p = {};
+  p.valid = true;
+  p.stationary = true;
+  p.phaseReadyStrong = a.phaseReadyStrong && b.phaseReadyStrong;
+  p.dac = a.dac;
+  p.amplitudeMs2 = 0.5 * (a.selectedMedianMs2 + b.selectedMedianMs2);
+  p.pairDriftPercent = driftPct;
+  p.recordsUsed = 2;
+  p.timestampMs = b.timestampMs;
+  p.totalMeanMs2 = 0.5 * (a.totalMeanMs2 + b.totalMeanMs2);
+  p.selectedPhaseSdDeg = fmax(a.selectedPhaseSdDeg, b.selectedPhaseSdDeg);
+
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    p.axisMeanMs2[axis] = 0.5 * (a.axisMeanMs2[axis] + b.axisMeanMs2[axis]);
+    p.axisSync[axis] = 0.5 * (a.axisSync[axis] + b.axisSync[axis]);
+    double angles[2] = {a.axisPhaseDeg[axis], b.axisPhaseDeg[axis]};
+    p.axisPhaseDeg[axis] = circularMeanDeg(angles, 2);
+  }
+  return p;
+}
+
+StablePoint stablePointFromSingleCoarseRecord(const ControlRecord &r) {
+  StablePoint p = {};
+  if (!r.amplitudeValid) return p;
+  p.valid = true;
+  p.stationary = false; // one record is reconnaissance only, not proof of stationarity
+  p.phaseReadyStrong = r.phaseReadyStrong;
+  p.dac = r.dac;
+  p.amplitudeMs2 = r.selectedMedianMs2;
+  p.pairDriftPercent = 0.0;
+  p.recordsUsed = 1;
+  p.timestampMs = r.timestampMs;
+  p.totalMeanMs2 = r.totalMeanMs2;
+  p.selectedPhaseSdDeg = r.selectedPhaseSdDeg;
+  for (uint8_t a = 0; a < 3; a++) {
+    p.axisMeanMs2[a] = r.axisMeanMs2[a];
+    p.axisSync[a] = r.axisSync[a];
+    p.axisPhaseDeg[a] = r.axisPhaseDeg[a];
+  }
+  return p;
+}
+
+StablePoint measureCoarseAdaptivePoint(double dac, const char *label, uint16_t &recordCounter) {
+  StablePoint out = {};
+  out.dac = quantizeDac(dac);
+  ControlRecord validRecords[STABLE_POINT_MAX_RECORDS];
+  uint8_t validCount = 0;
+
+  for (uint8_t attempt = 0; attempt < STABLE_POINT_MAX_RECORDS; attempt++) {
+    ControlRecord rec = measureControlRecord(out.dac, true);
+    recordCounter++;
+    printControlRecord(label, recordCounter, rec);
+
+    if (rec.safetyExceeded) { out.safetyExceeded = true; return out; }
+    if (rec.communicationFault || rec.rawClipped) { out.hardwareFault = true; return out; }
+    if (!rec.amplitudeValid) continue;
+
+    validRecords[validCount++] = rec;
+    double absErr = fabs(targetErrorPercent(rec.selectedMedianMs2));
+    if (absErr > FAST_COARSE_SINGLE_RECORD_ERROR_PERCENT && validCount == 1) {
+      Serial.print("  FAST_COARSE: |error|="); Serial.print(absErr, 1);
+      Serial.println(" % > 20% -> one clean canonical record accepted for coarse location only.");
+      return stablePointFromSingleCoarseRecord(rec);
+    }
+
+    if (validCount >= 2) {
+      double bestDrift = 1.0e99;
+      int bestI = -1, bestJ = -1;
+      for (uint8_t i = 0; i < validCount; i++) {
+        for (uint8_t j = i + 1; j < validCount; j++) {
+          double d = percentDifference(validRecords[i].selectedMedianMs2,
+                                       validRecords[j].selectedMedianMs2);
+          if (d < bestDrift) { bestDrift = d; bestI = i; bestJ = j; }
+        }
+      }
+      if (bestI >= 0 && bestDrift <= STABLE_PAIR_MAX_DRIFT_PERCENT) {
+        return aggregateStablePair(validRecords[bestI], validRecords[bestJ], bestDrift);
+      }
+    }
+  }
+
+  out.stationary = false;
+  return out;
+}
+
+StablePoint measureStablePoint(double dac, const char *label, uint16_t &recordCounter) {
+  StablePoint out = {};
+  out.dac = quantizeDac(dac);
+
+  ControlRecord validRecords[STABLE_POINT_MAX_RECORDS];
+  uint8_t validCount = 0;
+
+  for (uint8_t attempt = 0; attempt < STABLE_POINT_MAX_RECORDS; attempt++) {
+    ControlRecord rec = measureControlRecord(out.dac, true);
+    recordCounter++;
+    printControlRecord(label, recordCounter, rec);
+
+    if (rec.safetyExceeded) {
+      out.safetyExceeded = true;
+      return out;
+    }
+    if (rec.communicationFault || rec.rawClipped) {
+      out.hardwareFault = true;
+      return out;
+    }
+    if (!rec.amplitudeValid) continue;
+
+    validRecords[validCount++] = rec;
+
+    // As soon as any pair is sufficiently consistent, accept the closest pair.
+    if (validCount >= 2) {
+      double bestDrift = 1.0e99;
+      int bestI = -1, bestJ = -1;
+      for (uint8_t i = 0; i < validCount; i++) {
+        for (uint8_t j = i + 1; j < validCount; j++) {
+          double d = percentDifference(validRecords[i].selectedMedianMs2,
+                                       validRecords[j].selectedMedianMs2);
+          if (d < bestDrift) {
+            bestDrift = d;
+            bestI = i;
+            bestJ = j;
+          }
+        }
+      }
+      if (bestI >= 0 && bestDrift <= STABLE_PAIR_MAX_DRIFT_PERCENT) {
+        return aggregateStablePair(validRecords[bestI], validRecords[bestJ], bestDrift);
+      }
+    }
+  }
+
+  out.stationary = false;
+  return out;
+}
+
+void printStablePoint(const char *label, const StablePoint &p) {
+  Serial.print(label);
+  Serial.print(" | DAC "); Serial.print(p.dac, 2);
+  Serial.print(" | amp "); Serial.print(p.amplitudeMs2, 5);
+  Serial.print(" | pair drift "); Serial.print(p.pairDriftPercent, 2); Serial.print(" %");
+  Serial.print(" | Sync "); Serial.print(p.axisSync[axisIndex()], 3);
+  if (!p.valid) Serial.println(" | INVALID/NONSTATIONARY");
+  else Serial.println(" | STABLE");
+}
+
+// ============================================================================
+// TRANSIENT / TRANSFER-STATE DETECTORS
+// ============================================================================
+
+bool commonPathCollapse(const StablePoint &previous, const StablePoint &current) {
+  if (!previous.valid || !current.valid) return false;
+  if (current.dac <= previous.dac + 1.0e-9) return false;
+  if (previous.totalMeanMs2 < 0.10) return false;
+
+  double threshold = 1.0 - COMMON_PATH_COLLAPSE_PERCENT / 100.0;
+  if (current.totalMeanMs2 / previous.totalMeanMs2 > threshold) return false;
+
+  uint8_t collapsedAxes = 0;
+  for (uint8_t a = 0; a < 3; a++) {
+    if (previous.axisMeanMs2[a] < 0.08) continue;
+    if (current.axisMeanMs2[a] / previous.axisMeanMs2[a] < threshold) collapsedAxes++;
+  }
+  return collapsedAxes >= 2;
+}
+
+bool sameDacAbruptChange(const ControlRecord &previous, const ControlRecord &current) {
+  if (!previous.amplitudeValid || !current.amplitudeValid) return false;
+  if (fabs(previous.dac - current.dac) > 1.0e-9) return false;
+
+  if (percentDifference(previous.selectedMedianMs2, current.selectedMedianMs2) <
+      SAME_DAC_ABRUPT_PERCENT) return false;
+
+  double totalChange = percentDifference(previous.totalMeanMs2, current.totalMeanMs2);
+  uint8_t changedAxes = 0;
+  for (uint8_t a = 0; a < 3; a++) {
+    if (percentDifference(previous.axisMeanMs2[a], current.axisMeanMs2[a]) >=
+        SAME_DAC_ABRUPT_PERCENT) changedAxes++;
+  }
+  return totalChange >= SAME_DAC_ABRUPT_PERCENT || changedAxes >= 2;
+}
+
+// ============================================================================
+// HYBRID BRACKETED ROOT ACQUISITION
+// ============================================================================
+
+StablePoint chooseCloserPoint(const StablePoint &a, const StablePoint &b) {
+  if (!a.valid) return b;
+  if (!b.valid) return a;
+  double ea = fabs(targetErrorPercent(a.amplitudeMs2));
+  double eb = fabs(targetErrorPercent(b.amplitudeMs2));
+  if (ea < eb - 1.0e-9) return a;
+  if (eb < ea - 1.0e-9) return b;
+  if (a.pairDriftPercent < b.pairDriftPercent - 0.1) return a;
+  if (b.pairDriftPercent < a.pairDriftPercent - 0.1) return b;
+  return a.dac <= b.dac ? a : b;
+}
+
+bool refreshBracket(StablePoint &low, StablePoint &high, uint16_t &recordCounter) {
+  Serial.println("\nRefreshing bracket endpoints in the CURRENT plant state...");
+  StablePoint lowNew = measureStablePoint(low.dac, "BRACKET_LOW_REFRESH", recordCounter);
+  if (!lowNew.valid) return false;
+  StablePoint highNew = measureStablePoint(high.dac, "BRACKET_HIGH_REFRESH", recordCounter);
+  if (!highNew.valid) return false;
+
+  if (!(lowNew.dac < highNew.dac &&
+        lowNew.amplitudeMs2 < targetAmplitudeMs2 &&
+        highNew.amplitudeMs2 > targetAmplitudeMs2)) {
+    Serial.println("Bracket crossing moved during refresh.");
+    return false;
+  }
+
+  low = lowNew;
+  high = highNew;
+  return true;
+}
+
+// Arduino 1.8.x preprocessor-safe local re-bracket result codes.
+// Use uint8_t constants instead of a mid-file custom enum return type because
+// the legacy Arduino prototype generator can emit a function prototype before
+// seeing a locally-declared enum type.
+static const uint8_t LOCAL_RB_FAILED = 0;
+static const uint8_t LOCAL_RB_BRACKET_FOUND = 1;
+static const uint8_t LOCAL_RB_CANDIDATE_FOUND = 2;
+static const uint8_t LOCAL_RB_HARDWARE_FAULT = 3;
+static const uint8_t LOCAL_RB_SAFETY_STOP = 4;
+static const uint8_t LOCAL_RB_ABORTED = 5;
+
+// Recover locally after a previously valid bracket stops crossing the target.
+// The old bracket is used only to choose a starting DAC; every point used for
+// the recovered bracket is freshly measured in the CURRENT plant state.
+uint8_t tryLocalRebracket(const StablePoint &oldLow,
+                                        const StablePoint &oldHigh,
+                                        StablePoint &newLow,
+                                        StablePoint &newHigh,
+                                        StablePoint &candidate,
+                                        uint16_t &recordCounter,
+                                        uint16_t &qualityRejects) {
+  Serial.println("\n--- LOCAL RE-BRACKET RECOVERY ---");
+  Serial.println("Previous bracket no longer crosses the target.");
+  Serial.println("Trying the previous local solution region before a full DAC scan.");
+
+  if (checkEmergencyStop()) return LOCAL_RB_ABORTED;
+
+  double seedDac = chooseCloserPoint(oldLow, oldHigh).dac;
+  double oldSlope = 0.0;
+  if (oldLow.valid && oldHigh.valid && oldHigh.dac > oldLow.dac + 1.0e-9) {
+    oldSlope = (oldHigh.amplitudeMs2 - oldLow.amplitudeMs2) /
+               (oldHigh.dac - oldLow.dac);
+    if (isfinite(oldSlope) && oldSlope > MIN_VALID_SLOPE) {
+      double root = oldLow.dac +
+                    (targetAmplitudeMs2 - oldLow.amplitudeMs2) / oldSlope;
+      if (root >= DAC_MIN && root <= DAC_MAX) seedDac = root;
+    }
+  }
+  seedDac = quantizeDac(seedDac);
+  if (seedDac < DAC_MIN) seedDac = DAC_MIN;
+  if (seedDac > DAC_MAX) seedDac = DAC_MAX;
+
+  Serial.print("LOCAL RE-BRACKET seed DAC: "); Serial.println(seedDac, 2);
+  StablePoint seed = measureStablePoint(seedDac, "LOCAL_REBRACKET", recordCounter);
+  if (seed.safetyExceeded) return LOCAL_RB_SAFETY_STOP;
+  if (!seed.valid) {
+    qualityRejects++;
+    if (seed.hardwareFault) return LOCAL_RB_HARDWARE_FAULT;
+    Serial.println("Local seed was not stably measurable -> use normal full restart.");
+    return LOCAL_RB_FAILED;
+  }
+
+  candidate = seed;
+  if (inTargetBand(seed.amplitudeMs2, PREFERRED_BAND_PERCENT)) {
+    Serial.println("LOCAL RE-BRACKET: fresh seed is already in PREFERRED band.");
+    return LOCAL_RB_CANDIDATE_FOUND;
+  }
+
+  // Move only in the direction that can restore a sign crossing if the local
+  // DAC->amplitude slope remains positive. If that local assumption fails, the
+  // bounded search simply gives up and the original full V5.1 restart runs.
+  const int8_t direction = (seed.amplitudeMs2 < targetAmplitudeMs2) ? +1 : -1;
+  StablePoint previous = seed;
+  bool haveAcceptedFallback = inTargetBand(seed.amplitudeMs2, ACCEPTED_BAND_PERCENT);
+
+  for (uint8_t step = 1; step <= LOCAL_REBRACKET_MAX_STEPS; step++) {
+    if (checkEmergencyStop()) return LOCAL_RB_ABORTED;
+
+    double offset = direction * LOCAL_REBRACKET_STEP_DAC * step;
+    if (fabs(offset) > LOCAL_REBRACKET_RADIUS_DAC + 1.0e-9) break;
+    double d = quantizeDac(seedDac + offset);
+    if (d < DAC_MIN - 1.0e-9 || d > DAC_MAX + 1.0e-9) break;
+
+    StablePoint p = measureStablePoint(d, "LOCAL_REBRACKET", recordCounter);
+    if (p.safetyExceeded) return LOCAL_RB_SAFETY_STOP;
+    if (!p.valid) {
+      qualityRejects++;
+      if (p.hardwareFault) return LOCAL_RB_HARDWARE_FAULT;
+      continue;
+    }
+
+    candidate = chooseCloserPoint(candidate, p);
+    if (inTargetBand(p.amplitudeMs2, ACCEPTED_BAND_PERCENT)) {
+      haveAcceptedFallback = true;
+    }
+
+    if (inTargetBand(p.amplitudeMs2, PREFERRED_BAND_PERCENT)) {
+      candidate = p;
+      Serial.println("LOCAL RE-BRACKET: PREFERRED target recovered without a full scan.");
+      return LOCAL_RB_CANDIDATE_FOUND;
+    }
+
+    if (direction > 0 && previous.amplitudeMs2 < targetAmplitudeMs2 &&
+                        p.amplitudeMs2 > targetAmplitudeMs2 &&
+                        previous.dac < p.dac) {
+      newLow = previous;
+      newHigh = p;
+      Serial.println("LOCAL RE-BRACKET: fresh local sign bracket recovered.");
+      return LOCAL_RB_BRACKET_FOUND;
+    }
+    if (direction < 0 && p.amplitudeMs2 < targetAmplitudeMs2 &&
+                        previous.amplitudeMs2 > targetAmplitudeMs2 &&
+                        p.dac < previous.dac) {
+      newLow = p;
+      newHigh = previous;
+      Serial.println("LOCAL RE-BRACKET: fresh local sign bracket recovered.");
+      return LOCAL_RB_BRACKET_FOUND;
+    }
+
+    previous = p;
+  }
+
+  if (haveAcceptedFallback && candidate.valid &&
+      inTargetBand(candidate.amplitudeMs2, ACCEPTED_BAND_PERCENT)) {
+    Serial.print("LOCAL RE-BRACKET: no crossing found, but retained fresh ACCEPTED candidate DAC ");
+    Serial.print(candidate.dac, 2);
+    Serial.print(" | err ");
+    Serial.print(targetErrorPercent(candidate.amplitudeMs2), 2);
+    Serial.println(" %.");
+    return LOCAL_RB_CANDIDATE_FOUND;
+  }
+
+  Serial.println("LOCAL RE-BRACKET failed inside +/-3 DAC -> use normal full restart.");
+  return LOCAL_RB_FAILED;
+}
+
+AcquisitionResult acquireTargetOnce() {
+  AcquisitionResult out = {};
+  out.status = AcquireStatus::NONSTATIONARY;
+
+  Serial.println("\n============================================================");
+  Serial.println("STAGE 1 - STABLE AUTHORITY SCAN + V5 HYBRID ROOT REFINEMENT");
+  Serial.print("Frequency: "); Serial.print(testFrequencyHz, 5); Serial.println(" Hz");
+  Serial.print("Axis: "); Serial.println(axisChar());
+  Serial.print("Target: "); Serial.print(targetAmplitudeMs2, 5); Serial.println(" m/s^2 peak");
+  Serial.print("Preferred band: +/-"); Serial.print(PREFERRED_BAND_PERCENT, 1); Serial.println(" %");
+  Serial.print("Accepted band: +/-"); Serial.print(ACCEPTED_BAND_PERCENT, 1); Serial.println(" %");
+  Serial.println("Accepted points are retained as safe fallbacks and interpolation is tried.");
+  Serial.println("Every model point requires a stable same-DAC pair.");
+  Serial.println("Phase/Sync diagnostics do not gate amplitude acquisition.");
+  Serial.println("============================================================");
+
+  StablePoint previous = {};
+  bool havePrevious = false;
+  StablePoint best = {};
+  StablePoint low = {};
+  StablePoint high = {};
+  bool bracketFound = false;
+  bool everBelowTarget = false;
+  bool everAboveTarget = false;
+
+  // V5.1 warm start: one fresh measurement at the last proven same-condition
+  // solution. If it is not already accepted, abandon the hint immediately and
+  // execute the unchanged full V5 authority scan.
+  if (warmStartUsable()) {
+    Serial.print("WARM START - rechecking previous proven DAC ");
+    Serial.println(warmStartMemory.dac, 2);
+    StablePoint warm = measureStablePoint(warmStartMemory.dac, "WARM_START", out.recordsMeasured);
+    if (warm.valid && inTargetBand(warm.amplitudeMs2, ACCEPTED_BAND_PERCENT)) {
+      out.success = true;
+      out.status = inTargetBand(warm.amplitudeMs2, PREFERRED_BAND_PERCENT)
+          ? AcquireStatus::OK : AcquireStatus::QUANTIZATION_LIMITED;
+      out.candidate = warm;
+      Serial.println("WARM START ACCEPTED after fresh measurement.");
+      return out;
+    }
+    Serial.println("WARM START not valid for the current plant state -> full scan.");
+  }
+
+  for (double d = DAC_MIN; d <= DAC_MAX + 1.0e-9; d += COARSE_DAC_STEP) {
+    if (checkEmergencyStop()) {
+      out.status = AcquireStatus::ABORTED;
+      return out;
+    }
+
+    StablePoint p = measureCoarseAdaptivePoint(d, "COARSE", out.recordsMeasured);
+    if (p.safetyExceeded) {
+      out.status = AcquireStatus::SAFETY_STOP;
+      return out;
+    }
+    if (!p.valid) {
+      out.qualityRejects++;
+      if (p.hardwareFault) {
+        out.status = AcquireStatus::HARDWARE_FAULT;
+        return out;
+      }
+      continue;
+    }
+
+    if (havePrevious && previous.recordsUsed >= 2 && p.recordsUsed >= 2 &&
+        commonPathCollapse(previous, p)) {
+      Serial.println("COMMON-PATH COLLAPSE SUSPECTED - confirming same DAC before model update.");
+      StablePoint confirm = measureStablePoint(p.dac, "COLLAPSE_CONFIRM", out.recordsMeasured);
+      if (!confirm.valid) {
+        out.status = confirm.hardwareFault ? AcquireStatus::HARDWARE_FAULT
+                                           : AcquireStatus::NONSTATIONARY;
+        return out;
+      }
+      if (commonPathCollapse(previous, confirm)) {
+        Serial.println("Persistent common-path state change confirmed.");
+        out.status = AcquireStatus::NONSTATIONARY;
+        return out;
+      }
+      Serial.println("Transient collapse rejected; confirmation accepted.");
+      p = confirm;
+    }
+
+    if (p.amplitudeMs2 < targetAmplitudeMs2) everBelowTarget = true;
+    if (p.amplitudeMs2 > targetAmplitudeMs2) everAboveTarget = true;
+
+    // Preserve useful local slope information even when a coarse point itself
+    // lands directly in the preferred band. V5 could otherwise enter Stage 2
+    // with a good target but no slope memory.
+    if (havePrevious && p.dac > previous.dac &&
+        previous.recordsUsed >= 2 && p.recordsUsed >= 2) {
+      double localSlope = (p.amplitudeMs2 - previous.amplitudeMs2) /
+                          (p.dac - previous.dac);
+      pushSlope(localSlope);
+    }
+
+    StablePoint oldBest = best;
+    best = chooseCloserPoint(best, p);
+    bool becameBest = !oldBest.valid || fabs(targetErrorPercent(best.amplitudeMs2)) <
+                                      fabs(targetErrorPercent(oldBest.amplitudeMs2)) - 1.0e-9;
+
+    if (inTargetBand(p.amplitudeMs2, PREFERRED_BAND_PERCENT)) {
+      out.success = true;
+      out.status = AcquireStatus::OK;
+      out.candidate = p;
+      if (havePrevious && previous.dac < p.dac) {
+        if (previous.amplitudeMs2 < targetAmplitudeMs2) out.low = previous;
+        if (p.amplitudeMs2 > targetAmplitudeMs2) out.high = p;
+      }
+      return out;
+    }
+
+    if (becameBest && inTargetBand(best.amplitudeMs2, ACCEPTED_BAND_PERCENT)) {
+      Serial.print("ACCEPTED FALLBACK SAVED: DAC "); Serial.print(best.dac, 2);
+      Serial.print(" | amp "); Serial.print(best.amplitudeMs2, 5);
+      Serial.print(" | err "); Serial.print(targetErrorPercent(best.amplitudeMs2), 2);
+      Serial.println(" % - continuing to obtain a bracket for interpolation.");
+    }
+
+    // If the minimum DAC is already above target, no lower interpolation point
+    // exists. Accept it only if it is inside the accepted band.
+    if (!havePrevious && p.amplitudeMs2 > targetAmplitudeMs2) {
+      out.candidate = p;
+      if (inTargetBand(p.amplitudeMs2, ACCEPTED_BAND_PERCENT)) {
+        out.success = true;
+        out.status = AcquireStatus::QUANTIZATION_LIMITED;
+      } else if (fabs(p.dac - DAC_MIN) < 1.0e-9) {
+        // Only the actual minimum command can prove a true below-range target.
+        out.status = AcquireStatus::TARGET_BELOW_RANGE;
+      } else {
+        Serial.println("Lower DAC points were not stably qualified; range cannot be proven.");
+        out.status = AcquireStatus::NONSTATIONARY;
+      }
+      return out;
+    }
+
+    if (havePrevious && previous.amplitudeMs2 < targetAmplitudeMs2 &&
+                        p.amplitudeMs2 > targetAmplitudeMs2 &&
+                        previous.dac < p.dac) {
+      low = previous;
+      high = p;
+      bracketFound = true;
+      break;
+    }
+
+    previous = p;
+    havePrevious = true;
+  }
+
+  if (!bracketFound) {
+    out.candidate = best;
+    if (best.valid && inTargetBand(best.amplitudeMs2, ACCEPTED_BAND_PERCENT)) {
+      out.success = true;
+      out.status = AcquireStatus::QUANTIZATION_LIMITED;
+    } else if (everBelowTarget && everAboveTarget) {
+      // The target was crossed somewhere but no stable increasing bracket
+      // survived. Do not falsely call this an authority-limit failure.
+      Serial.println("Target crossing observed but response was non-monotonic/nonstationary.");
+      out.status = AcquireStatus::NONSTATIONARY;
+    } else if (everBelowTarget && !everAboveTarget) {
+      out.status = AcquireStatus::TARGET_ABOVE_RANGE;
+    } else {
+      out.status = AcquireStatus::NONSTATIONARY;
+    }
+    return out;
+  }
+
+  Serial.println("\n--- RAW SIGN BRACKET FOUND ---");
+  printStablePoint("LOW", low);
+  printStablePoint("HIGH", high);
+
+  {
+    StablePoint oldLow = low;
+    StablePoint oldHigh = high;
+    if (!refreshBracket(low, high, out.recordsMeasured)) {
+      StablePoint localCandidate = {};
+      uint8_t lr = tryLocalRebracket(oldLow, oldHigh, low, high,
+                                                   localCandidate, out.recordsMeasured,
+                                                   out.qualityRejects);
+      if (lr == LOCAL_RB_CANDIDATE_FOUND) {
+        out.candidate = localCandidate;
+        out.success = true;
+        out.status = inTargetBand(localCandidate.amplitudeMs2, PREFERRED_BAND_PERCENT)
+            ? AcquireStatus::OK : AcquireStatus::QUANTIZATION_LIMITED;
+        return out;
+      }
+      if (lr == LOCAL_RB_HARDWARE_FAULT) {
+        out.status = AcquireStatus::HARDWARE_FAULT;
+        return out;
+      }
+      if (lr == LOCAL_RB_SAFETY_STOP) {
+        out.status = AcquireStatus::SAFETY_STOP;
+        return out;
+      }
+      if (lr == LOCAL_RB_ABORTED) {
+        out.status = AcquireStatus::ABORTED;
+        return out;
+      }
+      if (lr != LOCAL_RB_BRACKET_FOUND) {
+        out.status = AcquireStatus::NONSTATIONARY;
+        return out;
+      }
+    }
+  }
+
+  out.low = low;
+  out.high = high;
+  best = chooseCloserPoint(low, high); // current-state fallback after refresh
+  pushSlope((high.amplitudeMs2 - low.amplitudeMs2) / (high.dac - low.dac));
+
+  for (uint8_t iteration = 0; iteration < MAX_REFINE_ITERATIONS; iteration++) {
+    if (checkEmergencyStop()) {
+      out.status = AcquireStatus::ABORTED;
+      return out;
+    }
+
+    if (inTargetBand(best.amplitudeMs2, PREFERRED_BAND_PERCENT)) {
+      out.success = true;
+      out.status = AcquireStatus::OK;
+      out.candidate = best;
+      out.low = low;
+      out.high = high;
+      return out;
+    }
+
+    bool acceptedFallback = inTargetBand(best.amplitudeMs2, ACCEPTED_BAND_PERCENT);
+    if (acceptedFallback) {
+      Serial.print("ACCEPTED FALLBACK ACTIVE: DAC "); Serial.print(best.dac, 2);
+      Serial.print(" | err "); Serial.print(targetErrorPercent(best.amplitudeMs2), 2);
+      Serial.println(" % - attempting bounded interpolation toward PREFERRED.");
+    }
+
+    double width = high.dac - low.dac;
+    if (width <= DAC_QUANTUM + 1.0e-9) {
+      out.candidate = best;
+      out.low = low;
+      out.high = high;
+      out.success = best.valid && inTargetBand(best.amplitudeMs2, ACCEPTED_BAND_PERCENT);
+      out.status = out.success ? AcquireStatus::QUANTIZATION_LIMITED
+                               : AcquireStatus::NONSTATIONARY;
+      return out;
+    }
+
+    uint32_t now = millis();
+    if ((now - low.timestampMs) > BRACKET_MAX_AGE_MS ||
+        (now - high.timestampMs) > BRACKET_MAX_AGE_MS) {
+      StablePoint oldLow = low;
+      StablePoint oldHigh = high;
+      if (!refreshBracket(low, high, out.recordsMeasured)) {
+        StablePoint localCandidate = {};
+        uint8_t lr = tryLocalRebracket(oldLow, oldHigh, low, high,
+                                                     localCandidate, out.recordsMeasured,
+                                                     out.qualityRejects);
+        if (lr == LOCAL_RB_CANDIDATE_FOUND) {
+          out.candidate = localCandidate;
+          out.success = true;
+          out.status = inTargetBand(localCandidate.amplitudeMs2, PREFERRED_BAND_PERCENT)
+              ? AcquireStatus::OK : AcquireStatus::QUANTIZATION_LIMITED;
+          return out;
+        }
+        if (lr == LOCAL_RB_HARDWARE_FAULT) {
+          out.status = AcquireStatus::HARDWARE_FAULT;
+          return out;
+        }
+        if (lr == LOCAL_RB_SAFETY_STOP) {
+          out.status = AcquireStatus::SAFETY_STOP;
+          return out;
+        }
+        if (lr == LOCAL_RB_ABORTED) {
+          out.status = AcquireStatus::ABORTED;
+          return out;
+        }
+        if (lr != LOCAL_RB_BRACKET_FOUND) {
+          out.status = AcquireStatus::NONSTATIONARY;
+          return out;
+        }
+      }
+      // A bracket refresh represents the current plant state. Do not prefer a
+      // stale old fallback over freshly remeasured endpoints.
+      best = chooseCloserPoint(low, high);
+      acceptedFallback = inTargetBand(best.amplitudeMs2, ACCEPTED_BAND_PERCENT);
+    }
+
+    double slope = (high.amplitudeMs2 - low.amplitudeMs2) / (high.dac - low.dac);
+    double predicted = 0.5 * (low.dac + high.dac); // safe bisection default
+    const char *refineMode = "BISECTION";
+
+    if (isfinite(slope) && slope > MIN_VALID_SLOPE) {
+      double secant = low.dac + (targetAmplitudeMs2 - low.amplitudeMs2) / slope;
+
+      if (acceptedFallback) {
+        // V5 requirement: once we already have an accepted fallback, explicitly
+        // try the interpolated/root estimate rather than rejecting it merely for
+        // lying near a bracket endpoint. Quantization/bounds still protect it.
+        if (secant > low.dac && secant < high.dac) {
+          predicted = secant;
+          refineMode = "ACCEPTED_INTERPOLATION";
+        }
+      } else {
+        double guard = SECANT_GUARD_FRACTION * width;
+        if (secant > low.dac + guard && secant < high.dac - guard) {
+          predicted = secant;
+          refineMode = "SECANT";
+        }
+      }
+    }
+
+    double testDac = quantizeDac(predicted);
+    if (testDac <= low.dac + 1.0e-9) testDac = quantizeDac(low.dac + DAC_QUANTUM);
+    if (testDac >= high.dac - 1.0e-9) testDac = quantizeDac(high.dac - DAC_QUANTUM);
+
+    Serial.print("\nREFINE "); Serial.print(iteration + 1);
+    Serial.print(" | mode "); Serial.print(refineMode);
+    Serial.print(" | bracket "); Serial.print(low.dac, 2); Serial.print("(");
+    Serial.print(low.amplitudeMs2, 4); Serial.print(") -> ");
+    Serial.print(high.dac, 2); Serial.print("("); Serial.print(high.amplitudeMs2, 4);
+    Serial.print(") | slope "); Serial.print(slope, 6);
+    Serial.print(" | predicted "); Serial.print(predicted, 3);
+    Serial.print(" | test DAC "); Serial.println(testDac, 2);
+
+    StablePoint savedBest = best;
+    double savedBestAbsErr = fabs(targetErrorPercent(savedBest.amplitudeMs2));
+
+    StablePoint p = measureStablePoint(testDac, "REFINE", out.recordsMeasured);
+    if (!p.valid) {
+      out.qualityRejects++;
+      if (p.hardwareFault) {
+        out.status = AcquireStatus::HARDWARE_FAULT;
+        return out;
+      }
+      p = measureStablePoint(testDac, "REFINE_RETRY", out.recordsMeasured);
+      if (!p.valid) {
+        out.status = p.hardwareFault ? AcquireStatus::HARDWARE_FAULT
+                                     : AcquireStatus::NONSTATIONARY;
+        return out;
+      }
+    }
+
+    double pAbsErr = fabs(targetErrorPercent(p.amplitudeMs2));
+    if (pAbsErr < savedBestAbsErr - 1.0e-9) best = p;
+
+    if (p.amplitudeMs2 < targetAmplitudeMs2) low = p;
+    else high = p;
+
+    if (high.dac > low.dac) {
+      double newSlope = (high.amplitudeMs2 - low.amplitudeMs2) / (high.dac - low.dac);
+      pushSlope(newSlope);
+    }
+    out.low = low;
+    out.high = high;
+
+    if (inTargetBand(p.amplitudeMs2, PREFERRED_BAND_PERCENT)) {
+      best = p;
+      Serial.println("REFINEMENT RESULT: PREFERRED band reached; keeping measured refinement.");
+      continue; // top of loop performs clean success return
+    }
+
+    if (acceptedFallback) {
+      if (pAbsErr < savedBestAbsErr - REFINEMENT_IMPROVEMENT_EPS_PERCENT) {
+        Serial.print("REFINEMENT RESULT: improved accepted fallback by ");
+        Serial.print(savedBestAbsErr - pAbsErr, 2); Serial.println(" percentage points; continuing.");
+      } else {
+        best = savedBest;
+        Serial.println("REFINEMENT RESULT: no meaningful measured improvement.");
+        Serial.print("Restoring accepted fallback DAC "); Serial.print(best.dac, 2);
+        Serial.print(" | err "); Serial.print(targetErrorPercent(best.amplitudeMs2), 2);
+        Serial.println(" % and ending acquisition without hunting.");
+        out.candidate = best;
+        out.success = true;
+        out.status = AcquireStatus::QUANTIZATION_LIMITED;
+        return out;
+      }
+    }
+  }
+
+  out.candidate = best;
+  out.success = best.valid && inTargetBand(best.amplitudeMs2, ACCEPTED_BAND_PERCENT);
+  out.status = out.success ? AcquireStatus::QUANTIZATION_LIMITED : AcquireStatus::NONSTATIONARY;
+  return out;
+}
+
+AcquisitionResult acquireTargetWithRestart() {
+  clearSlopeHistory();
+  AcquisitionResult last = {};
+  uint32_t acquisitionStartMs = millis();
+
+  for (uint8_t restart = 0; restart <= MAX_ACQUISITION_RESTARTS; restart++) {
+    if (restart > 0) {
+      Serial.println("\n============================================================");
+      Serial.print("ACQUISITION RESTART "); Serial.println(restart);
+      Serial.println("Local re-bracket failed or no stable bracket survived; performing full scan.");
+      Serial.println("============================================================");
+      if (!interruptibleDelay(500)) break;
+    }
+
+    last = acquireTargetOnce();
+    last.restarts = restart;
+    last.elapsedMs = millis() - acquisitionStartMs;
+    if (last.success) return last;
+    if (last.status != AcquireStatus::NONSTATIONARY) return last;
+    if (checkEmergencyStop()) return last;
+  }
+  last.elapsedMs = millis() - acquisitionStartMs;
+  return last;
+}
+
+const char *acquireStatusText(AcquireStatus s) {
+  switch (s) {
+    case AcquireStatus::OK: return "PREFERRED_TARGET_ACQUIRED";
+    case AcquireStatus::QUANTIZATION_LIMITED: return "ACCEPTED_QUANTIZATION_LIMITED";
+    case AcquireStatus::TARGET_BELOW_RANGE: return "TARGET_BELOW_DAC_RANGE";
+    case AcquireStatus::TARGET_ABOVE_RANGE: return "TARGET_ABOVE_DAC_RANGE";
+    case AcquireStatus::NONSTATIONARY: return "NONSTATIONARY";
+    case AcquireStatus::HARDWARE_FAULT: return "HARDWARE_FAULT";
+    case AcquireStatus::SAFETY_STOP: return "SAFETY_STOP";
+    default: return "ABORTED";
+  }
+}
+
+void printAcquisitionSummary(const AcquisitionResult &r) {
+  Serial.println("\n============================================================");
+  Serial.println("ACQUISITION SUMMARY");
+  Serial.print("Status: "); Serial.println(acquireStatusText(r.status));
+  Serial.print("Success: "); Serial.println(r.success ? "YES" : "NO");
+  Serial.print("Canonical records measured: "); Serial.println(r.recordsMeasured);
+  Serial.print("Quality rejects: "); Serial.println(r.qualityRejects);
+  Serial.print("Restarts: "); Serial.println(r.restarts);
+  Serial.print("Acquisition time: "); Serial.print(r.elapsedMs / 1000.0, 3); Serial.println(" s");
+  if (r.candidate.valid) {
+    Serial.print("Candidate DAC: "); Serial.println(r.candidate.dac, 2);
+    Serial.print("Candidate amplitude: "); Serial.print(r.candidate.amplitudeMs2, 5);
+    Serial.print(" | error "); Serial.print(targetErrorPercent(r.candidate.amplitudeMs2), 2); Serial.println(" %");
+
+  }
+  Serial.println("============================================================");
+}
+
+void acceptAcquisition(const AcquisitionResult &r) {
+  targetAcquired = r.success && r.candidate.valid;
+  if (!targetAcquired) return;
+
+  lockedPoint = r.candidate;
+  lastBracketLow = r.low;
+  lastBracketHigh = r.high;
+
+  if (r.low.valid && r.high.valid && r.high.dac > r.low.dac) {
+    pushSlope((r.high.amplitudeMs2 - r.low.amplitudeMs2) /
+              (r.high.dac - r.low.dac));
+  }
+}
+
+// ============================================================================
+// V5.1 FINAL CANDIDATE CONFIRMATION
+// ============================================================================
+
+bool confirmCandidateForServo(AcquisitionResult &acq, ServoState &state) {
+  Serial.println("\n============================================================");
+  Serial.println("V5.1R CANDIDATE FIXED-DAC CONFIRMATION");
+  Serial.println("Three fresh records; no DAC movement while stability is checked.");
+  Serial.println("============================================================");
+
+  ControlRecord valid[CANDIDATE_CONFIRM_RECORDS];
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < CANDIDATE_CONFIRM_RECORDS; i++) {
+    ControlRecord r = measureControlRecord(currentDacAmplitude, false);
+    printControlRecord("CANDIDATE_CONFIRM", i + 1, r);
+    if (r.safetyExceeded || r.communicationFault || r.rawClipped) return false;
+    if (r.amplitudeValid && count < CANDIDATE_CONFIRM_RECORDS) valid[count++] = r;
+  }
+
+  if (count < CANDIDATE_CONFIRM_MIN_VALID) {
+    Serial.println("CANDIDATE_NONSTATIONARY - too few valid confirmation records.");
+    return false;
+  }
+
+  double amps[3];
+  double mean = 0.0;
+  double minAmp = 1.0e99, maxAmp = -1.0e99;
+  for (uint8_t i = 0; i < count; i++) {
+    amps[i] = valid[i].selectedMedianMs2;
+    mean += amps[i];
+    minAmp = fmin(minAmp, amps[i]);
+    maxAmp = fmax(maxAmp, amps[i]);
+  }
+  mean /= count;
+  double cv = count >= 2 ? 100.0 * sampleSdSmall(amps, count, mean) / fmax(mean, 1.0e-12) : 0.0;
+  double spread = percentDifference(minAmp, maxAmp);
+
+  Serial.print("Candidate confirmation mean: "); Serial.print(mean, 5);
+  Serial.print(" | error "); Serial.print(targetErrorPercent(mean), 2);
+  Serial.print(" % | inter-record CV "); Serial.print(cv, 2);
+  Serial.print(" % | spread "); Serial.print(spread, 2); Serial.println(" %");
+
+  if (!inTargetBand(mean, ACCEPTED_BAND_PERCENT) ||
+      cv > CANDIDATE_CONFIRM_MAX_CV_PERCENT ||
+      spread > CANDIDATE_CONFIRM_MAX_SPREAD_PERCENT) {
+    Serial.println("CANDIDATE_NONSTATIONARY - do not let PI chase this state.");
+    return false;
+  }
+
+  setPlantBaselineFromRecords(state.plantBaseline, valid, count);
+  lockedPlantBaseline = state.plantBaseline;
+  lockedPoint.dac = currentDacAmplitude;
+  lockedPoint.amplitudeMs2 = mean;
+  lockedPoint.valid = true;
+  lockedPoint.stationary = true;
+  for (uint8_t a = 0; a < 3; a++) lockedPoint.axisMeanMs2[a] = state.plantBaseline.axisMeanMs2[a];
+  lockedPoint.totalMeanMs2 = state.plantBaseline.totalMeanMs2;
+  acq.candidate = lockedPoint;
+
+  Serial.println("CANDIDATE CONFIRMED STABLE.");
+  return true;
+}
+
+// ============================================================================
+// SLOW ADAPTIVE PI SERVO
+// ============================================================================
+
+void resetServoState(ServoState &s) {
+  memset(&s, 0, sizeof(s));
+  clearTrialState(s);
+}
+
+ServoStatus validateAndPrepareServoRecord(ControlRecord &rec, ServoState &state) {
+  if (rec.safetyExceeded) return ServoStatus::SAFETY_STOP;
+
+  if (!rec.amplitudeValid) {
+    state.invalidCount++;
+    Serial.print("SERVO INVALID #"); Serial.print(state.invalidCount);
+    Serial.println(" - no DAC correction; remeasure.");
+    if (state.invalidCount >= MAX_CONSECUTIVE_INVALID_SERVO_RECORDS) {
+      return rec.communicationFault ? ServoStatus::HARDWARE_FAULT
+                                    : ServoStatus::NEEDS_REACQUIRE;
+    }
+    return ServoStatus::COMPLETED;
+  }
+  state.invalidCount = 0;
+
+  // V5.1 verified trial logic. A new DAC is not accepted on one record.
+  if (state.trialPending) {
+    if (fabs(rec.dac - currentDacAmplitude) > 1.0e-9) return ServoStatus::NEEDS_REACQUIRE;
+
+    if (state.trialValidCount < TRIAL_VERIFY_RECORDS) {
+      uint8_t i = state.trialValidCount;
+      state.trialAmp[i] = rec.selectedMedianMs2;
+      for (uint8_t a = 0; a < 3; a++) state.trialAxisSum[a] += rec.axisMeanMs2[a];
+      state.trialTotalSum += rec.totalMeanMs2;
+      state.trialMaxCvPercent = fmax(state.trialMaxCvPercent, rec.cvPercent);
+      state.trialValidCount++;
+    }
+
+    if (state.trialValidCount < TRIAL_VERIFY_RECORDS) {
+      Serial.println("TRIAL_VERIFY - first post-step record stored; waiting for confirmation.");
+      return ServoStatus::COMPLETED;
+    }
+
+    double trialAmp = 0.5 * (state.trialAmp[0] + state.trialAmp[1]);
+    double trialErr = fabs(targetErrorPercent(trialAmp));
+    double oldErr = fabs(state.trialOldErrorPct);
+    double trialDrift = percentDifference(state.trialAmp[0], state.trialAmp[1]);
+    bool improved = trialErr <= oldErr - TRIAL_REQUIRED_IMPROVEMENT_PERCENT;
+    bool stableTrial = trialDrift <= STABLE_PAIR_MAX_DRIFT_PERCENT &&
+                       state.trialMaxCvPercent <= RECORD_MAX_CV_PERCENT;
+
+    if (improved && stableTrial) {
+      double learned = (trialAmp - state.trialOldAmp) /
+                       (currentDacAmplitude - state.trialOldDac);
+      if (learned >= MIN_VALID_SLOPE && learned <= MAX_VALID_SLOPE) {
+        pushSlope(learned);
+        Serial.print("LOCAL_SLOPE_ACCEPTED,dA_dDAC="); Serial.println(learned, 6);
+      } else {
+        Serial.print("LOCAL_SLOPE_REJECTED,dA_dDAC="); Serial.println(learned, 6);
+      }
+
+      setPlantBaselineFromTrialAverages(state.plantBaseline, state, currentDacAmplitude);
+      lockedPlantBaseline = state.plantBaseline;
+      state.unproductiveCorrections = 0;
+      rec.selectedMedianMs2 = trialAmp;
+      for (uint8_t a = 0; a < 3; a++) rec.axisMeanMs2[a] = state.plantBaseline.axisMeanMs2[a];
+      rec.totalMeanMs2 = state.plantBaseline.totalMeanMs2;
+      Serial.print("TRIAL_ACCEPTED | verified error "); Serial.print(trialErr, 2);
+      Serial.print(" % vs old "); Serial.print(oldErr, 2); Serial.println(" %");
+      clearTrialState(state);
+    } else {
+      double badDac = currentDacAmplitude;
+      double restoreDac = state.trialOldDac;
+      PlantBaseline restoreBaseline = state.trialOldBaseline;
+      Serial.print("TRIAL_REJECTED | verified error "); Serial.print(trialErr, 2);
+      Serial.print(" % vs old "); Serial.print(oldErr, 2);
+      Serial.print(" % | reverting DAC "); Serial.print(badDac, 2);
+      Serial.print(" -> "); Serial.println(restoreDac, 2);
+
+      if (!setVisatonAmplitudeContinuous(restoreDac)) return ServoStatus::ABORTED;
+      if (!interruptibleDelay(adaptiveSettleMs(badDac, restoreDac))) return ServoStatus::ABORTED;
+      state.plantBaseline = restoreBaseline;
+      lockedPlantBaseline = restoreBaseline;
+      state.unproductiveCorrections++;
+      clearTrialState(state);
+      state.havePrevious = false;
+      state.persistentSign = 0;
+      state.persistenceCount = 0;
+      state.integralErrorMs2 *= 0.5;
+
+      if (state.unproductiveCorrections >= MAX_UNPRODUCTIVE_CORRECTIONS) {
+        Serial.println("Repeated verified corrections failed -> REACQUIRE.");
+        return ServoStatus::NEEDS_REACQUIRE;
+      }
+      return ServoStatus::COMPLETED;
+    }
+  }
+
+  // V5.1 baseline-aware plant-state guard. If the same DAC produces a response
+  // inconsistent with the confirmed XYZ fingerprint, confirm once more without
+  // changing DAC. Persistent mismatch means the plant moved: stop PI and reacquire.
+  if (plantStateMismatch(state.plantBaseline, rec, true)) {
+    Serial.println("PLANT_CHANGE_SUSPECTED - confirming at the same DAC.");
+    ControlRecord confirm = measureControlRecord(currentDacAmplitude, false);
+    printControlRecord("PLANT_CONFIRM", 1, confirm);
+    if (!confirm.amplitudeValid) return ServoStatus::NEEDS_REACQUIRE;
+    if (plantStateMismatch(state.plantBaseline, confirm, true)) {
+      Serial.println("PLANT_CHANGE_CONFIRMED -> stop PI and REACQUIRE.");
+      return ServoStatus::NEEDS_REACQUIRE;
+    }
+    Serial.println("Plant-change suspicion rejected as a transient.");
+    rec = confirm;
+  }
+
+  // Retain V5's hard 20% same-DAC guard as a second independent fallback.
+  if (state.havePrevious && sameDacAbruptChange(state.previous, rec)) {
+    Serial.println("ABRUPT SAME-DAC CHANGE - confirming without changing DAC.");
+    ControlRecord confirm = measureControlRecord(currentDacAmplitude, false);
+    if (!confirm.amplitudeValid) return ServoStatus::NEEDS_REACQUIRE;
+    if (sameDacAbruptChange(state.previous, confirm)) {
+      Serial.println("Persistent transfer-state change confirmed -> REACQUIRE.");
+      return ServoStatus::NEEDS_REACQUIRE;
+    }
+    rec = confirm;
+  }
+
+  return ServoStatus::LOCKED;
+}
+
+ServoStatus maybeApplyServoCorrection(const ControlRecord &rec, ServoState &state,
+                                      uint16_t &correctionCounter, const char *context) {
+  double errorPct = targetErrorPercent(rec.selectedMedianMs2);
+  double errorMs2 = targetAmplitudeMs2 - rec.selectedMedianMs2;
+
+  if (fabs(errorPct) <= SERVO_DEADBAND_PERCENT) {
+    state.persistentSign = 0;
+    state.persistenceCount = 0;
+    state.integralErrorMs2 *= 0.5; // gently unwind integral near target
+    state.previous = rec;
+    state.havePrevious = true;
+    return ServoStatus::LOCKED;
+  }
+
+  int8_t sign = errorMs2 > 0.0 ? +1 : -1; // low amp -> increase DAC
+  if (sign == state.persistentSign) state.persistenceCount++;
+  else {
+    state.persistentSign = sign;
+    state.persistenceCount = 1;
+  }
+
+  // Accumulate a small bounded integral only for persistent out-of-band error.
+  state.integralErrorMs2 += errorMs2;
+  double iLimit = INTEGRAL_LIMIT_TARGET_FRACTION * targetAmplitudeMs2;
+  state.integralErrorMs2 = clampDouble(state.integralErrorMs2, -iLimit, iLimit);
+
+  uint8_t requiredPersistence = fabs(errorPct) >= SERVO_SEVERE_ERROR_PERCENT
+      ? SERVO_SEVERE_PERSISTENCE_RECORDS
+      : SERVO_ERROR_PERSISTENCE_RECORDS;
+
+  if (state.persistenceCount < requiredPersistence) {
+    state.previous = rec;
+    state.havePrevious = true;
+    return ServoStatus::LOCKED;
+  }
+
+  double slope = medianSlope();
+  double maxStep = fabs(errorPct) >= SERVO_SEVERE_ERROR_PERCENT
+      ? SERVO_SEVERE_MAX_STEP_DAC : SERVO_NORMAL_MAX_STEP_DAC;
+
+  double correction = 0.0;
+  const char *action = "SAFE_DIRECTION_STEP";
+
+  if (slope >= MIN_VALID_SLOPE && slope <= MAX_VALID_SLOPE) {
+    double amplitudeCommand = SERVO_KP * errorMs2 + SERVO_KI * state.integralErrorMs2;
+    correction = amplitudeCommand / slope;
+    correction = clampDouble(correction, -maxStep, maxStep);
+    action = "ADAPTIVE_PI_SLOPE";
+  } else {
+    correction = static_cast<double>(sign) * SERVO_NORMAL_MAX_STEP_DAC;
+  }
+
+  double nextDac = quantizeDac(currentDacAmplitude + correction);
+  if (fabs(nextDac - currentDacAmplitude) < 1.0e-9) {
+    nextDac = quantizeDac(currentDacAmplitude + static_cast<double>(sign) * DAC_QUANTUM);
+  }
+
+  if (fabs(nextDac - currentDacAmplitude) < 1.0e-9) {
+    Serial.println("SERVO reached DAC boundary; no further authority in requested direction.");
+    return ServoStatus::AUTHORITY_LIMIT;
+  }
+
+  // QUANTIZATION-AWARE GUARD:
+  // A common DAC quantum can correspond to very different acceleration changes
+  // on X, Y and Z because the local dA/dDAC slope is axis/frequency dependent.
+  // If the learned slope predicts that the smallest realizable move will make the
+  // absolute amplitude error no better, do not create a limit cycle.
+  if (slope >= MIN_VALID_SLOPE && slope <= MAX_VALID_SLOPE) {
+    double predictedAmp = rec.selectedMedianMs2 + slope * (nextDac - currentDacAmplitude);
+    double predictedErrPct = targetErrorPercent(predictedAmp);
+    if (fabs(predictedErrPct) >= fabs(errorPct) - SERVO_QUANTIZATION_GUARD_MARGIN_PERCENT) {
+      Serial.print(context);
+      Serial.print(" QUANTIZATION_GUARD - hold DAC "); Serial.print(currentDacAmplitude, 2);
+      Serial.print(" | current err "); Serial.print(errorPct, 2);
+      Serial.print(" % | candidate "); Serial.print(nextDac, 2);
+      Serial.print(" predicted err "); Serial.print(predictedErrPct, 2); Serial.println(" %");
+      state.persistentSign = 0;
+      state.persistenceCount = 0;
+      state.integralErrorMs2 *= 0.5;
+      state.previous = rec;
+      state.havePrevious = true;
+      return ServoStatus::LOCKED;
+    }
+  } else if (fabs(errorPct) < SERVO_SEVERE_ERROR_PERCENT) {
+    // Do not make a blind quantized step for a modest error before a usable local
+    // slope exists. Wait for more evidence; severe errors may still use safe direction.
+    Serial.print(context);
+    Serial.println(" NO_SLOPE_GUARD - modest error retained; no blind DAC step.");
+    state.persistentSign = 0;
+    state.persistenceCount = 0;
+    state.integralErrorMs2 *= 0.5;
+    state.previous = rec;
+    state.havePrevious = true;
+    return ServoStatus::LOCKED;
+  }
+
+  double oldDac = currentDacAmplitude;
+
+  // V5.1: mark this as a trial. The next two valid records decide whether the
+  // step is kept or reverted; slope learning also waits for that verification.
+  state.trialPending = true;
+  state.trialOldDac = oldDac;
+  state.trialOldAmp = rec.selectedMedianMs2;
+  state.trialOldErrorPct = errorPct;
+  state.trialOldBaseline = state.plantBaseline;
+  state.trialValidCount = 0;
+  state.trialAmp[0] = state.trialAmp[1] = 0.0;
+  for (uint8_t a = 0; a < 3; a++) state.trialAxisSum[a] = 0.0;
+  state.trialTotalSum = 0.0;
+  state.trialMaxCvPercent = 0.0;
+
+  if (!setVisatonAmplitudeContinuous(nextDac)) {
+    clearTrialState(state);
+    return ServoStatus::ABORTED;
+  }
+  correctionCounter++;
+
+  Serial.print(context); Serial.print(" DAC correction ");
+  Serial.print(oldDac, 2); Serial.print(" -> "); Serial.print(nextDac, 2);
+  Serial.print(" | action TRIAL_"); Serial.print(action);
+  Serial.print(" | slope "); Serial.println(slope, 6);
+
+  if (!interruptibleDelay(adaptiveSettleMs(oldDac, nextDac))) return ServoStatus::ABORTED;
+
+  // Post-change record must not be compared as if it were same-DAC continuity.
+  state.havePrevious = false;
+  state.persistentSign = 0;
+  state.persistenceCount = 0;
+  return ServoStatus::LOCKED;
+}
+
+ServoStatus runServoAcquire(ServoState &state) {
+  Serial.println("\n============================================================");
+  Serial.println("STAGE 2 - SLOW AMPLITUDE SERVO LOCK");
+  Serial.print("Target lock band: +/-"); Serial.print(SERVO_LOCK_BAND_PERCENT, 1); Serial.println(" %");
+  Serial.print("Deadband: +/-"); Serial.print(SERVO_DEADBAND_PERCENT, 1); Serial.println(" %");
+  Serial.println("Two consecutive lock-band records are required.");
+  Serial.println("============================================================");
+
+  uint8_t lockCount = 0;
+  uint16_t corrections = 0;
+
+  for (uint8_t recordIndex = 1; recordIndex <= SERVO_ACQUIRE_MAX_RECORDS; recordIndex++) {
+    if (checkEmergencyStop()) return ServoStatus::ABORTED;
+
+    ControlRecord rec = measureControlRecord(currentDacAmplitude, false);
+    printControlRecord("SERVO_ACQUIRE", recordIndex, rec);
+
+    ServoStatus prep = validateAndPrepareServoRecord(rec, state);
+    if (prep == ServoStatus::COMPLETED) continue; // invalid sample; retry
+    if (prep != ServoStatus::LOCKED) return prep;
+
+    if (inTargetBand(rec.selectedMedianMs2, SERVO_LOCK_BAND_PERCENT)) lockCount++;
+    else lockCount = 0;
+
+    if (lockCount >= SERVO_LOCK_CONSECUTIVE_RECORDS) {
+      lockedPoint.dac = rec.dac;
+      lockedPoint.amplitudeMs2 = rec.selectedMedianMs2;
+      lockedPoint.valid = true;
+      lockedPoint.stationary = true;
+      Serial.println("SERVO LOCK ACQUIRED.");
+      return ServoStatus::LOCKED;
+    }
+
+    ServoStatus action = maybeApplyServoCorrection(rec, state, corrections, "SERVO_ACQUIRE");
+    if (action != ServoStatus::LOCKED) return action;
+  }
+
+  Serial.println("Servo did not achieve two consecutive lock-band records.");
+  return ServoStatus::NEEDS_REACQUIRE;
+}
+
+// ============================================================================
+// CLOSED-LOOP HOLD WITH RUNNING STATISTICS
+// ============================================================================
+
+HoldResult runClosedLoopHold(uint8_t seconds, ServoState &state) {
+  HoldResult out = {};
+  out.status = ServoStatus::COMPLETED;
+
+  // Start the hold with a clean PI/persistence state. Keep the learned global
+  // dA/dDAC slope history, but do not let acquisition-stage integral or error
+  // persistence trigger an immediate hold correction.
+  state.integralErrorMs2 = 0.0;
+  state.persistentSign = 0;
+  state.persistenceCount = 0;
+  state.invalidCount = 0;
+  state.unproductiveCorrections = 0;
+  clearTrialState(state);
+  state.havePrevious = false;
+
+  Serial.println("\n============================================================");
+  Serial.println("STAGE 3 - CLOSED-LOOP AMPLITUDE HOLD");
+  Serial.print("Duration: "); Serial.print(seconds); Serial.println(" s");
+  Serial.print("Primary pass band: +/-"); Serial.print(HOLD_FINAL_BAND_PERCENT, 1); Serial.println(" %");
+  Serial.print("Tight reported band: +/-"); Serial.print(HOLD_TIGHT_BAND_PERCENT, 1); Serial.println(" %");
+  Serial.println("DAC may move slowly; NCO phase remains continuous.");
+  Serial.println("CSV_HEADER,HOLD,t_s,DAC,Axis,Target,Measured,Error_pct,X,Y,Z,CV_pct,MAD_pct,CorrectionCount");
+  Serial.println("============================================================");
+
+  RunningStats ampStats, syncStats, dacStats;
+  resetRunningStats(ampStats);
+  resetRunningStats(syncStats);
+  resetRunningStats(dacStats);
+  double errorSquareSum = 0.0;
+  double maxAbsErrorPercent = 0.0;
+
+  bool havePhase = false;
+  double previousWrappedPhase = 0.0;
+  double unwrappedPhase = 0.0;
+  double minUnwrappedPhase = 0.0;
+  double maxUnwrappedPhase = 0.0;
+
+  uint32_t startMs = millis();
+  uint16_t recordIndex = 0;
+
+  while (millis() - startMs < static_cast<uint32_t>(seconds) * 1000UL) {
+    if (checkEmergencyStop()) {
+      out.status = ServoStatus::ABORTED;
+      return out;
+    }
+
+    ControlRecord rec = measureControlRecord(currentDacAmplitude, false);
+    recordIndex++;
+
+    ServoStatus prep = validateAndPrepareServoRecord(rec, state);
+    if (prep == ServoStatus::COMPLETED) continue;
+    if (prep != ServoStatus::LOCKED) {
+      out.status = prep;
+      return out;
+    }
+
+    double errPct = targetErrorPercent(rec.selectedMedianMs2);
+    pushRunningStats(ampStats, rec.selectedMedianMs2);
+    pushRunningStats(syncStats, rec.axisSync[axisIndex()]); // diagnostic only
+    pushRunningStats(dacStats, rec.dac);
+    errorSquareSum += errPct * errPct;
+    if (fabs(errPct) > maxAbsErrorPercent) maxAbsErrorPercent = fabs(errPct);
+
+    if (inTargetBand(rec.selectedMedianMs2, HOLD_TIGHT_BAND_PERCENT)) out.tightInBandRecords++;
+    if (inTargetBand(rec.selectedMedianMs2, HOLD_FINAL_BAND_PERCENT)) out.finalInBandRecords++;
+
+    double phase = rec.axisPhaseDeg[axisIndex()];
+    if (!havePhase) {
+      havePhase = true;
+      previousWrappedPhase = phase;
+      unwrappedPhase = phase;
+      minUnwrappedPhase = phase;
+      maxUnwrappedPhase = phase;
+    } else {
+      double delta = wrapDegrees(phase - previousWrappedPhase);
+      unwrappedPhase += delta;
+      previousWrappedPhase = phase;
+      if (unwrappedPhase < minUnwrappedPhase) minUnwrappedPhase = unwrappedPhase;
+      if (unwrappedPhase > maxUnwrappedPhase) maxUnwrappedPhase = unwrappedPhase;
+    }
+
+    Serial.print("HOLD,");
+    Serial.print((millis() - startMs) / 1000.0, 2); Serial.print(",");
+    Serial.print(rec.dac, 2); Serial.print(",");
+    Serial.print(axisChar()); Serial.print(",");
+    Serial.print(targetAmplitudeMs2, 5); Serial.print(",");
+    Serial.print(rec.selectedMedianMs2, 5); Serial.print(",");
+    Serial.print(errPct, 2); Serial.print(",");
+    Serial.print(rec.axisMeanMs2[0], 5); Serial.print(",");
+    Serial.print(rec.axisMeanMs2[1], 5); Serial.print(",");
+    Serial.print(rec.axisMeanMs2[2], 5); Serial.print(",");
+    Serial.print(rec.cvPercent, 2); Serial.print(",");
+    Serial.print(rec.madPercent, 2); Serial.print(",");
+    Serial.println(out.corrections);
+
+    ServoStatus action = maybeApplyServoCorrection(rec, state, out.corrections, "HOLD");
+    if (action != ServoStatus::LOCKED) {
+      out.status = action;
+      return out;
+    }
+  }
+
+  out.completed = true;
+  out.validRecords = ampStats.n;
+  if (ampStats.n == 0) {
+    out.status = ServoStatus::NEEDS_REACQUIRE;
+    return out;
+  }
+
+  out.meanAmplitudeMs2 = ampStats.mean;
+  out.sdAmplitudeMs2 = runningSd(ampStats);
+  out.cvPercent = 100.0 * out.sdAmplitudeMs2 / fmax(out.meanAmplitudeMs2, 1.0e-12);
+  out.meanErrorPercent = targetErrorPercent(out.meanAmplitudeMs2);
+  out.tightInBandPercent = 100.0 * static_cast<double>(out.tightInBandRecords) /
+                           static_cast<double>(out.validRecords);
+  out.finalInBandPercent = 100.0 * static_cast<double>(out.finalInBandRecords) /
+                           static_cast<double>(out.validRecords);
+  out.rmsErrorPercent = sqrt(errorSquareSum / static_cast<double>(out.validRecords));
+  out.maxAbsErrorPercent = maxAbsErrorPercent;
+  out.meanSyncRatio = syncStats.mean; // diagnostic only; never gates amplitude PASS
+  out.phaseSpanDeg = havePhase ? maxUnwrappedPhase - minUnwrappedPhase : 999.0;
+  out.minAmplitudeMs2 = ampStats.minValue;
+  out.maxAmplitudeMs2 = ampStats.maxValue;
+  out.minDac = dacStats.minValue;
+  out.maxDac = dacStats.maxValue;
+  out.meanDac = dacStats.mean;
+
+  if (out.meanSyncRatio >= HOLD_STRONG_SYNC && out.phaseSpanDeg <= HOLD_STRONG_PHASE_SPAN_DEG) {
+    out.phaseClass = PhaseClass::STRONG;
+  } else if (out.meanSyncRatio >= HOLD_MODERATE_SYNC &&
+             out.phaseSpanDeg <= HOLD_MODERATE_PHASE_SPAN_DEG) {
+    out.phaseClass = PhaseClass::MODERATE;
+  } else {
+    out.phaseClass = PhaseClass::WEAK;
+  }
+
+  out.amplitudePass = out.validRecords >= HOLD_MIN_VALID_RECORDS &&
+                      inTargetBand(out.meanAmplitudeMs2, HOLD_FINAL_BAND_PERCENT) &&
+                      out.cvPercent <= HOLD_MAX_CV_PERCENT &&
+                      out.rmsErrorPercent <= HOLD_MAX_RMS_ERROR_PERCENT;
+
+  out.phaseSweepReady = out.amplitudePass &&
+                        out.finalInBandPercent >= PHASE_READY_MIN_IN_BAND_PERCENT &&
+                        out.cvPercent <= PHASE_READY_MAX_CV_PERCENT &&
+                        out.rmsErrorPercent <= PHASE_READY_MAX_RMS_ERROR_PERCENT &&
+                        out.corrections <= PHASE_READY_MAX_CORRECTIONS;
+
+  Serial.println("\n---------------- CLOSED-LOOP HOLD SUMMARY ----------------");
+  Serial.print("Valid records: "); Serial.println(out.validRecords);
+  Serial.print("Mean amplitude: "); Serial.print(out.meanAmplitudeMs2, 5);
+  Serial.print(" m/s^2 | mean error "); Serial.print(out.meanErrorPercent, 2); Serial.println(" %");
+  Serial.print("CV: "); Serial.print(out.cvPercent, 2); Serial.println(" %");
+  Serial.print("Tight (+/-2.5%) in-band: "); Serial.print(out.tightInBandPercent, 1); Serial.println(" %");
+  Serial.print("Primary (+/-5%) in-band [reported]: "); Serial.print(out.finalInBandPercent, 1); Serial.println(" %");
+  Serial.print("Hold RMS error: "); Serial.print(out.rmsErrorPercent, 2); Serial.println(" %");
+  Serial.print("Maximum absolute hold error: "); Serial.print(out.maxAbsErrorPercent, 2); Serial.println(" %");
+  Serial.print("Amplitude min/max: "); Serial.print(out.minAmplitudeMs2, 5);
+  Serial.print(" / "); Serial.println(out.maxAmplitudeMs2, 5);
+  Serial.print("DAC mean/min/max: "); Serial.print(out.meanDac, 3); Serial.print(" / ");
+  Serial.print(out.minDac, 2); Serial.print(" / "); Serial.println(out.maxDac, 2);
+  Serial.print("Servo corrections: "); Serial.println(out.corrections);
+  Serial.print("Amplitude regulation: "); Serial.println(out.amplitudePass ? "PASS" : "FAIL");
+  Serial.print("Phase-sweep readiness: "); Serial.println(out.phaseSweepReady ? "READY" : "NOT READY");
+  Serial.println("-----------------------------------------------------------");
+  return out;
+}
+
+// ============================================================================
+// VECTOR FFT VERIFICATION
+// ============================================================================
+
+void clearSpectrum(double spectrum[]) {
+  for (uint16_t i = 0; i < HALF_BINS; i++) spectrum[i] = 0.0;
+}
+
+bool acquireFftFrame() {
+  if (!verifyAdxl2(false)) return false;
+
+  uint32_t nextSampleUs = micros();
+  RawAcceleration previous = {};
+  bool havePrevious = false;
+  uint16_t stagnantRun = 0;
+  uint16_t longestStagnantRun = 0;
+  uint16_t zeroTriplets = 0;
+  bool clipped = false;
+  uint32_t lateSamples = 0;
+
+  for (uint16_t i = 0; i < FFT_SAMPLES; i++) {
+    while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {}
+    uint32_t actualUs = micros();
+    if (actualUs - nextSampleUs > LATE_SAMPLE_WARNING_US) lateSamples++;
+    nextSampleUs += SAMPLE_PERIOD_US;
+
+    RawAcceleration raw = readRawXYZ();
+    rawX[i] = raw.x;
+    rawY[i] = raw.y;
+    rawZ[i] = raw.z;
+
+    if (raw.x == 0 && raw.y == 0 && raw.z == 0) zeroTriplets++;
+    if (abs(static_cast<int>(raw.x)) >= ADXL_RAW_CLIP_LIMIT ||
+        abs(static_cast<int>(raw.y)) >= ADXL_RAW_CLIP_LIMIT ||
+        abs(static_cast<int>(raw.z)) >= ADXL_RAW_CLIP_LIMIT) clipped = true;
+
+    if (havePrevious && raw.x == previous.x && raw.y == previous.y && raw.z == previous.z) {
+      stagnantRun++;
+      if (stagnantRun > longestStagnantRun) longestStagnantRun = stagnantRun;
+    } else {
+      stagnantRun = 0;
+    }
+    previous = raw;
+    havePrevious = true;
+  }
+
+  return verifyAdxl2(false) && !clipped &&
+         lateSamples <= MAX_LATE_SAMPLES_PER_WINDOW &&
+         zeroTriplets <= MAX_ZERO_TRIPLETS &&
+         longestStagnantRun <= MAX_STAGNANT_RUN;
+}
+
+void accumulateSpectrum(const int16_t source[], double destination[]) {
+  double meanRaw = 0.0;
+  for (uint16_t i = 0; i < FFT_SAMPLES; i++) meanRaw += source[i];
+  meanRaw /= static_cast<double>(FFT_SAMPLES);
+
+  for (uint16_t i = 0; i < FFT_SAMPLES; i++) {
+    fftReal[i] = (static_cast<double>(source[i]) - meanRaw) * ADXL_MS2_PER_LSB;
+    fftImag[i] = 0.0;
+  }
+
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  for (uint16_t bin = 1; bin < HALF_BINS; bin++) destination[bin] += fftReal[bin];
+}
+
+double averageMagnitude(const double spectrum[], uint16_t bin) {
+  return spectrum[bin] / static_cast<double>(FFT_FRAMES);
+}
+
+double magnitudeToAmplitude(double magnitude) {
+  return 2.0 * magnitude /
+         (static_cast<double>(FFT_SAMPLES) * HAMMING_COHERENT_GAIN);
+}
+
+VectorFftResult analyzeVectorBand(double minHz, double maxHz) {
+  VectorFftResult out = {};
+
+  uint16_t lo = static_cast<uint16_t>(ceil(minHz * FFT_SAMPLES / SAMPLE_RATE_HZ));
+  uint16_t hi = static_cast<uint16_t>(floor(maxHz * FFT_SAMPLES / SAMPLE_RATE_HZ));
+  if (lo < 1) lo = 1;
+  if (hi >= HALF_BINS) hi = HALF_BINS - 1;
+  if (hi <= lo) return out;
+
+  double bestCombined = -1.0;
+  uint16_t bestBin = lo;
+
+  for (uint16_t bin = lo; bin <= hi; bin++) {
+    double x = averageMagnitude(spectrumX, bin);
+    double y = averageMagnitude(spectrumY, bin);
+    double z = averageMagnitude(spectrumZ, bin);
+    double combined = sqrt(x*x + y*y + z*z);
+    if (combined > bestCombined) {
+      bestCombined = combined;
+      bestBin = bin;
+    }
+  }
+
+  double delta = 0.0;
+  if (bestBin > lo && bestBin < hi) {
+    double m0, m1, m2;
+    {
+      uint16_t b = bestBin - 1;
+      double x = averageMagnitude(spectrumX, b);
+      double y = averageMagnitude(spectrumY, b);
+      double z = averageMagnitude(spectrumZ, b);
+      m0 = sqrt(x*x + y*y + z*z);
+    }
+    {
+      uint16_t b = bestBin;
+      double x = averageMagnitude(spectrumX, b);
+      double y = averageMagnitude(spectrumY, b);
+      double z = averageMagnitude(spectrumZ, b);
+      m1 = sqrt(x*x + y*y + z*z);
+    }
+    {
+      uint16_t b = bestBin + 1;
+      double x = averageMagnitude(spectrumX, b);
+      double y = averageMagnitude(spectrumY, b);
+      double z = averageMagnitude(spectrumZ, b);
+      m2 = sqrt(x*x + y*y + z*z);
+    }
+    double denom = m0 - 2.0*m1 + m2;
+    if (fabs(denom) > 1.0e-12) {
+      delta = clampDouble(0.5 * (m0 - m2) / denom, -0.5, 0.5);
+    }
+  }
+
+  out.frequencyHz = (static_cast<double>(bestBin) + delta) * SAMPLE_RATE_HZ /
+                    static_cast<double>(FFT_SAMPLES);
+  out.xAmplitudeMs2 = magnitudeToAmplitude(averageMagnitude(spectrumX, bestBin));
+  out.yAmplitudeMs2 = magnitudeToAmplitude(averageMagnitude(spectrumY, bestBin));
+  out.zAmplitudeMs2 = magnitudeToAmplitude(averageMagnitude(spectrumZ, bestBin));
+  out.totalAmplitudeMs2 = sqrt(out.xAmplitudeMs2*out.xAmplitudeMs2 +
+                               out.yAmplitudeMs2*out.yAmplitudeMs2 +
+                               out.zAmplitudeMs2*out.zAmplitudeMs2);
+  out.dominantAxis = dominantAxis(out.xAmplitudeMs2, out.yAmplitudeMs2, out.zAmplitudeMs2);
+
+  double noiseSum = 0.0;
+  uint16_t noiseCount = 0;
+  for (uint16_t bin = lo; bin <= hi; bin++) {
+    if (abs(static_cast<int>(bin) - static_cast<int>(bestBin)) <= FFT_PEAK_EXCLUSION_BINS) continue;
+    double x = averageMagnitude(spectrumX, bin);
+    double y = averageMagnitude(spectrumY, bin);
+    double z = averageMagnitude(spectrumZ, bin);
+    noiseSum += sqrt(x*x + y*y + z*z);
+    noiseCount++;
+  }
+
+  if (bestCombined > 0.0 && noiseCount > 0 && noiseSum > 0.0) {
+    out.snrDb = 20.0 * log10(bestCombined / (noiseSum / noiseCount));
+  }
+
+  out.valid = out.totalAmplitudeMs2 >= FFT_MIN_AMPLITUDE_MS2 &&
+              out.snrDb >= FFT_MIN_SNR_DB;
+  return out;
+}
+
+bool runLocalVectorFft(VectorFftResult &out) {
+  clearSpectrum(spectrumX);
+  clearSpectrum(spectrumY);
+  clearSpectrum(spectrumZ);
+
+  for (uint8_t frame = 0; frame < FFT_FRAMES; frame++) {
+    if (!acquireFftFrame()) return false;
+    accumulateSpectrum(rawX, spectrumX);
+    accumulateSpectrum(rawY, spectrumY);
+    accumulateSpectrum(rawZ, spectrumZ);
+  }
+
+  out = analyzeVectorBand(testFrequencyHz - LOCAL_SEARCH_HALF_WIDTH_HZ,
+                          testFrequencyHz + LOCAL_SEARCH_HALF_WIDTH_HZ);
+  return out.valid;
+}
+
+void printFftResult(const VectorFftResult &r) {
+  Serial.println("\n---------------- VECTOR FFT VERIFICATION ----------------");
+  if (!r.valid) {
+    Serial.println("FFT verification: FAIL QUALITY");
+    return;
+  }
+  Serial.print("Command frequency: "); Serial.print(testFrequencyHz, 5); Serial.println(" Hz");
+  Serial.print("Actual NCO frequency: "); Serial.print(actualNcoFrequencyHz(), 7); Serial.println(" Hz");
+  Serial.print("Vector local FFT: "); Serial.print(r.frequencyHz, 5);
+  Serial.print(" Hz | error "); Serial.print(r.frequencyHz - testFrequencyHz, 5); Serial.println(" Hz");
+  Serial.print("X/Y/Z FFT amp: "); Serial.print(r.xAmplitudeMs2, 5); Serial.print(" / ");
+  Serial.print(r.yAmplitudeMs2, 5); Serial.print(" / "); Serial.println(r.zAmplitudeMs2, 5);
+  Serial.print("Total: "); Serial.print(r.totalAmplitudeMs2, 5);
+  Serial.print(" | SNR "); Serial.print(r.snrDb, 2);
+  Serial.print(" dB | dominant "); Serial.println(r.dominantAxis);
+  Serial.println("---------------------------------------------------------");
+}
+
+
+bool acquireAndServoLock(AcquisitionResult &acq, ServoState &servo);
+
+// ============================================================================
+// INTEGRATED HARD-CODED 240..320 Hz DUAL-ADXL FFT + QUADRATURE DISCOVERY
+// ============================================================================
+
+const char *discAxisName(uint8_t axis) {
+  if (axis == 0) return "X";
+  if (axis == 1) return "Y";
+  return "Z";
+}
+
+bool discRawTripletZero(const RawAcceleration &a) {
+  return a.x == 0 && a.y == 0 && a.z == 0;
+}
+
+bool discRawTripletClipped(const RawAcceleration &a) {
+  return abs(static_cast<int>(a.x)) >= ADXL_RAW_CLIP_LIMIT ||
+         abs(static_cast<int>(a.y)) >= ADXL_RAW_CLIP_LIMIT ||
+         abs(static_cast<int>(a.z)) >= ADXL_RAW_CLIP_LIMIT;
+}
+
+uint16_t discMinSearchBin() {
+  uint16_t b = static_cast<uint16_t>(ceil(DISC_SEARCH_MIN_HZ / DISC_FFT_RESOLUTION_HZ));
+  if (b < 1) b = 1;
+  return b;
+}
+
+uint16_t discMaxSearchBin() {
+  uint16_t b = static_cast<uint16_t>(floor(DISC_SEARCH_MAX_HZ / DISC_FFT_RESOLUTION_HZ));
+  if (b >= HALF_BINS) b = HALF_BINS - 1;
+  return b;
+}
+
+void discClearSpectrum(double spectrum[]) {
+  for (uint16_t i = 0; i < HALF_BINS; i++) spectrum[i] = 0.0;
+}
+
+void discClearAllSpectra() {
+  discClearSpectrum(discToolSpecX);
+  discClearSpectrum(discToolSpecY);
+  discClearSpectrum(discToolSpecZ);
+  discClearSpectrum(discHandSpecX);
+  discClearSpectrum(discHandSpecY);
+  discClearSpectrum(discHandSpecZ);
+  discClearSpectrum(discToolVectorSpectrum);
+}
+
+void discAccumulateSpectrum(const int16_t source[], double destination[]) {
+  double mean = 0.0;
+  for (uint16_t i = 0; i < FFT_SAMPLES; i++) {
+    mean += static_cast<double>(source[i]) * ADXL_MS2_PER_LSB;
+  }
+  mean /= static_cast<double>(FFT_SAMPLES);
+
+  for (uint16_t i = 0; i < FFT_SAMPLES; i++) {
+    fftReal[i] = static_cast<double>(source[i]) * ADXL_MS2_PER_LSB - mean;
+    fftImag[i] = 0.0;
+  }
+
+  FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
+  FFT.compute(FFTDirection::Forward);
+  FFT.complexToMagnitude();
+
+  for (uint16_t bin = 1; bin < HALF_BINS; bin++) destination[bin] += fftReal[bin];
+}
+
+double discAvgMag(const double spectrum[], uint16_t bin) {
+  return spectrum[bin] / static_cast<double>(FFT_FRAMES);
+}
+
+double discFftMagnitudeToPeakAmplitude(double magnitude) {
+  return (2.0 * magnitude) /
+         (static_cast<double>(FFT_SAMPLES) * HAMMING_COHERENT_GAIN);
+}
+
+double discParabolicOffset(const double spectrum[], uint16_t bin) {
+  if (bin < 1 || bin + 1 >= HALF_BINS) return 0.0;
+  double a = discAvgMag(spectrum, bin - 1);
+  double b = discAvgMag(spectrum, bin);
+  double c = discAvgMag(spectrum, bin + 1);
+  double den = a - 2.0 * b + c;
+  if (fabs(den) < 1.0e-18) return 0.0;
+  return clampDouble(0.5 * (a - c) / den, -0.5, 0.5);
+}
+
+double discParabolicPeakMagnitude(const double spectrum[], uint16_t bin, double delta) {
+  double a = discAvgMag(spectrum, bin - 1);
+  double b = discAvgMag(spectrum, bin);
+  double c = discAvgMag(spectrum, bin + 1);
+  return b - 0.25 * (a - c) * delta;
+}
+
+double discCalculateSpectrumSnrDb(const double spectrum[], uint16_t peakBin) {
+  uint16_t lo = discMinSearchBin();
+  uint16_t hi = discMaxSearchBin();
+  double noiseSum = 0.0;
+  uint16_t noiseCount = 0;
+  for (uint16_t bin = lo; bin <= hi; bin++) {
+    if (abs(static_cast<int>(bin) - static_cast<int>(peakBin)) <= DISC_PEAK_EXCLUSION_BINS) continue;
+    noiseSum += discAvgMag(spectrum, bin);
+    noiseCount++;
+  }
+  double peak = discAvgMag(spectrum, peakBin);
+  if (peak <= 0.0 || noiseCount == 0) return 0.0;
+  double noise = noiseSum / static_cast<double>(noiseCount);
+  if (noise <= 0.0) return 0.0;
+  return 20.0 * log10(peak / noise);
+}
+
+DiscoveryAxisFFTResult discAnalyzeAxisFFT(const double spectrum[]) {
+  DiscoveryAxisFFTResult result = {};
+  uint16_t lo = discMinSearchBin();
+  uint16_t hi = discMaxSearchBin();
+  uint16_t bestBin = lo;
+  double bestMag = 0.0;
+  for (uint16_t bin = lo; bin <= hi; bin++) {
+    double m = discAvgMag(spectrum, bin);
+    if (m > bestMag) {
+      bestMag = m;
+      bestBin = bin;
+    }
+  }
+  double delta = discParabolicOffset(spectrum, bestBin);
+  double peakMag = discParabolicPeakMagnitude(spectrum, bestBin, delta);
+  result.bin = bestBin;
+  result.frequencyHz = (static_cast<double>(bestBin) + delta) * DISC_FFT_RESOLUTION_HZ;
+  result.amplitudeMs2 = discFftMagnitudeToPeakAmplitude(peakMag);
+  result.snrDb = discCalculateSpectrumSnrDb(spectrum, bestBin);
+  result.valid = result.amplitudeMs2 >= DISC_MIN_SIGNAL_AMPLITUDE_MS2 &&
+                 result.snrDb >= DISC_MIN_FFT_SNR_DB;
+  return result;
+}
+
+bool discIsLocalMaximum(const double spectrum[], uint16_t bin, uint16_t lo, uint16_t hi) {
+  if (bin <= lo || bin >= hi) return false;
+  return spectrum[bin] > spectrum[bin - 1] && spectrum[bin] >= spectrum[bin + 1];
+}
+
+void discBuildVectorSpectrum(const double sx[], const double sy[], const double sz[], double out[]) {
+  for (uint16_t bin = 0; bin < HALF_BINS; bin++) {
+    double x = discAvgMag(sx, bin);
+    double y = discAvgMag(sy, bin);
+    double z = discAvgMag(sz, bin);
+    out[bin] = sqrt(x * x + y * y + z * z);
+  }
+}
+
+double discCalculateVectorSnrDb(const double vectorSpectrum[], uint16_t peakBin) {
+  uint16_t lo = discMinSearchBin();
+  uint16_t hi = discMaxSearchBin();
+  double noiseSum = 0.0;
+  uint16_t noiseCount = 0;
+  for (uint16_t bin = lo; bin <= hi; bin++) {
+    if (abs(static_cast<int>(bin) - static_cast<int>(peakBin)) <= DISC_PEAK_EXCLUSION_BINS) continue;
+    noiseSum += vectorSpectrum[bin];
+    noiseCount++;
+  }
+  double peak = vectorSpectrum[peakBin];
+  if (peak <= 0.0 || noiseCount == 0) return 0.0;
+  double noise = noiseSum / static_cast<double>(noiseCount);
+  if (noise <= 0.0) return 0.0;
+  return 20.0 * log10(peak / noise);
+}
+
+DiscoveryTiming discAcquirePairedRecord(uint16_t sampleCount) {
+  DiscoveryTiming timing = {};
+  uint32_t nextSampleUs = micros();
+  uint32_t startUs = nextSampleUs;
+  uint64_t separationSumUs = 0;
+
+  for (uint16_t i = 0; i < sampleCount; i++) {
+    while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {}
+    uint32_t actualStartUs = micros();
+    uint32_t latenessUs = actualStartUs - nextSampleUs;
+    nextSampleUs += SAMPLE_PERIOD_US;
+    if (latenessUs > timing.maxScheduleLatenessUs) timing.maxScheduleLatenessUs = latenessUs;
+    if (latenessUs > DISC_LATE_SAMPLE_WARNING_US) timing.lateSampleCount++;
+
+    uint32_t toolReadUs = micros();
+    RawAcceleration tool = dualReadRawXYZ(PIN_CS_ADXL1);
+    uint32_t handReadUs = micros();
+    RawAcceleration hand = dualReadRawXYZ(PIN_CS_ADXL2);
+    uint32_t sep = handReadUs - toolReadUs;
+    separationSumUs += sep;
+    if (sep > timing.maxReadSeparationUs) timing.maxReadSeparationUs = sep;
+
+    discToolX[i] = tool.x; discToolY[i] = tool.y; discToolZ[i] = tool.z;
+    discHandX[i] = hand.x; discHandY[i] = hand.y; discHandZ[i] = hand.z;
+
+    if (discRawTripletZero(tool)) timing.zeroTriplets++;
+    if (discRawTripletZero(hand)) timing.zeroTriplets++;
+    if (discRawTripletClipped(tool)) timing.clippedSamples++;
+    if (discRawTripletClipped(hand)) timing.clippedSamples++;
+  }
+
+  timing.elapsedUs = micros() - startUs;
+  timing.meanReadSeparationUs = static_cast<double>(separationSumUs) /
+                                static_cast<double>(sampleCount);
+  timing.valid = timing.zeroTriplets <= DISC_MAX_ZERO_TRIPLETS_PER_RECORD &&
+                 timing.clippedSamples == 0;
+  return timing;
+}
+
+bool discAcquireThreeFftFrames() {
+  discClearAllSpectra();
+  if (!verifyBothIntegratedSensorsOrRecover()) return false;
+
+  for (uint8_t frame = 0; frame < FFT_FRAMES; frame++) {
+    bool accepted = false;
+    for (uint8_t attempt = 0; attempt <= DISC_MAX_FRAME_RETRIES && !accepted; attempt++) {
+      DiscoveryTiming t = discAcquirePairedRecord(FFT_SAMPLES);
+      if (!t.valid) {
+        Serial.print("FFT frame "); Serial.print(frame + 1);
+        Serial.print(" integrity reject | zero triplets "); Serial.print(t.zeroTriplets);
+        Serial.print(" | clipped samples "); Serial.println(t.clippedSamples);
+        if (!verifyBothIntegratedSensorsOrRecover()) return false;
+        continue;
+      }
+
+      discAccumulateSpectrum(discToolX, discToolSpecX);
+      discAccumulateSpectrum(discToolY, discToolSpecY);
+      discAccumulateSpectrum(discToolZ, discToolSpecZ);
+      discAccumulateSpectrum(discHandX, discHandSpecX);
+      discAccumulateSpectrum(discHandY, discHandSpecY);
+      discAccumulateSpectrum(discHandZ, discHandSpecZ);
+
+      Serial.print("Paired narrowband FFT frame "); Serial.print(frame + 1);
+      Serial.print("/3 accepted | elapsed "); Serial.print(t.elapsedUs / 1000.0, 2);
+      Serial.print(" ms | mean tool->hand read separation ");
+      Serial.print(t.meanReadSeparationUs, 2);
+      Serial.print(" us | late samples "); Serial.println(t.lateSampleCount);
+      accepted = true;
+    }
+    if (!accepted) return false;
+  }
+
+  discBuildVectorSpectrum(discToolSpecX, discToolSpecY, discToolSpecZ, discToolVectorSpectrum);
+  return true;
+}
+
+void discAnalyzeIndependentFftResults() {
+  discoveryToolFFT.axis[0] = discAnalyzeAxisFFT(discToolSpecX);
+  discoveryToolFFT.axis[1] = discAnalyzeAxisFFT(discToolSpecY);
+  discoveryToolFFT.axis[2] = discAnalyzeAxisFFT(discToolSpecZ);
+  discoveryHandFFT.axis[0] = discAnalyzeAxisFFT(discHandSpecX);
+  discoveryHandFFT.axis[1] = discAnalyzeAxisFFT(discHandSpecY);
+  discoveryHandFFT.axis[2] = discAnalyzeAxisFFT(discHandSpecZ);
+}
+
+void discFindToolCandidates() {
+  discoveryCandidateCount = 0;
+  for (uint8_t i = 0; i < DISC_TOP_CANDIDATES; i++) discoveryCandidates[i] = {};
+
+  uint16_t lo = discMinSearchBin();
+  uint16_t hi = discMaxSearchBin();
+  bool excluded[HALF_BINS];
+  for (uint16_t i = 0; i < HALF_BINS; i++) excluded[i] = false;
+
+  for (uint8_t rank = 0; rank < DISC_TOP_CANDIDATES; rank++) {
+    uint16_t bestBin = 0;
+    double best = 0.0;
+    for (uint16_t bin = lo; bin <= hi; bin++) {
+      if (excluded[bin]) continue;
+      if (!discIsLocalMaximum(discToolVectorSpectrum, bin, lo, hi)) continue;
+      if (discToolVectorSpectrum[bin] > best) {
+        best = discToolVectorSpectrum[bin];
+        bestBin = bin;
+      }
+    }
+    if (bestBin == 0 || best <= 0.0) break;
+
+    DiscoveryCandidate &c = discoveryCandidates[discoveryCandidateCount];
+    c.fftRank = discoveryCandidateCount + 1;
+    c.bin = bestBin;
+    double a = discToolVectorSpectrum[bestBin - 1];
+    double b = discToolVectorSpectrum[bestBin];
+    double d = discToolVectorSpectrum[bestBin + 1];
+    double den = a - 2.0 * b + d;
+    double delta = 0.0;
+    if (fabs(den) > 1.0e-18) delta = clampDouble(0.5 * (a - d) / den, -0.5, 0.5);
+    double peakVectorMag = b - 0.25 * (a - d) * delta;
+    c.fftSeedHz = (static_cast<double>(bestBin) + delta) * DISC_FFT_RESOLUTION_HZ;
+    c.fftVectorAmplitudeMs2 = discFftMagnitudeToPeakAmplitude(peakVectorMag);
+    c.fftSnrDb = discCalculateVectorSnrDb(discToolVectorSpectrum, bestBin);
+    c.fftValid = c.fftVectorAmplitudeMs2 >= DISC_MIN_SIGNAL_AMPLITUDE_MS2 &&
+                 c.fftSnrDb >= DISC_MIN_FFT_SNR_DB;
+    discoveryCandidateCount++;
+
+    int start = static_cast<int>(bestBin) - DISC_PEAK_EXCLUSION_BINS;
+    int end = static_cast<int>(bestBin) + DISC_PEAK_EXCLUSION_BINS;
+    if (start < static_cast<int>(lo)) start = lo;
+    if (end > static_cast<int>(hi)) end = hi;
+    for (int bin = start; bin <= end; bin++) excluded[bin] = true;
+  }
+}
+
+DiscoveryAxisQuadResult discAnalyzeAxisQuadrature(const int16_t samples[], double referenceHz) {
+  DiscoveryAxisQuadResult result = {};
+  result.referenceHz = referenceHz;
+  result.refinedHz = referenceHz;
+  if (referenceHz <= 0.0 || referenceHz >= SAMPLE_RATE_HZ * 0.5) return result;
+
+  double blockPhase[DISC_QUAD_BLOCKS];
+  double blockAmplitude[DISC_QUAD_BLOCKS];
+  double blockSync[DISC_QUAD_BLOCKS];
+  const double KK_TWO_PI = 2.0 * PI;
+
+  // ------------------------------------------------------------------------
+  // Short-block quadrature analysis.
+  // Each 256-sample block is only ~160 ms long at the measured acquisition
+  // rate.  A slowly wandering hand-held tool can therefore remain strongly
+  // periodic locally even when a single 1.6 s reference sinusoid loses sync.
+  // ------------------------------------------------------------------------
+  for (uint8_t block = 0; block < DISC_QUAD_BLOCKS; block++) {
+    uint32_t offset = static_cast<uint32_t>(block) * DISC_QUAD_BLOCK_N;
+    double mean = 0.0;
+    for (uint16_t n = 0; n < DISC_QUAD_BLOCK_N; n++) {
+      mean += static_cast<double>(samples[offset + n]);
+    }
+    mean /= static_cast<double>(DISC_QUAD_BLOCK_N);
+
+    double I = 0.0, Q = 0.0, windowSum = 0.0, blockSumSq = 0.0;
+    for (uint16_t n = 0; n < DISC_QUAD_BLOCK_N; n++) {
+      uint32_t globalIndex = offset + n;
+      double centered = (static_cast<double>(samples[globalIndex]) - mean) * ADXL_MS2_PER_LSB;
+      blockSumSq += centered * centered;
+
+      double w = 0.5 - 0.5 * cos(KK_TWO_PI * static_cast<double>(n) /
+                                 static_cast<double>(DISC_QUAD_BLOCK_N - 1));
+      double theta = KK_TWO_PI * referenceHz * static_cast<double>(globalIndex) / SAMPLE_RATE_HZ;
+      double v = centered * w;
+      I += v * cos(theta);
+      Q += v * sin(theta);
+      windowSum += w;
+    }
+
+    blockPhase[block] = atan2(-Q, I);
+    blockAmplitude[block] = windowSum > 0.0 ? 2.0 * sqrt(I * I + Q * Q) / windowSum : 0.0;
+
+    double blockTotalRms = sqrt(blockSumSq / static_cast<double>(DISC_QUAD_BLOCK_N));
+    double blockSyncRms = blockAmplitude[block] / sqrt(2.0);
+    blockSync[block] = blockTotalRms > 1.0e-12 ? blockSyncRms / blockTotalRms : 0.0;
+    blockSync[block] = clampDouble(blockSync[block], 0.0, 1.0);
+  }
+
+  // Median local synchronization is robust to one or two disturbed blocks.
+  double sortedSync[DISC_QUAD_BLOCKS];
+  for (uint8_t i = 0; i < DISC_QUAD_BLOCKS; i++) sortedSync[i] = blockSync[i];
+  for (uint8_t i = 1; i < DISC_QUAD_BLOCKS; i++) {
+    double key = sortedSync[i];
+    int j = static_cast<int>(i) - 1;
+    while (j >= 0 && sortedSync[j] > key) {
+      sortedSync[j + 1] = sortedSync[j];
+      j--;
+    }
+    sortedSync[j + 1] = key;
+  }
+  if ((DISC_QUAD_BLOCKS & 1U) != 0U) {
+    result.localMedianSyncRatio = sortedSync[DISC_QUAD_BLOCKS / 2];
+  } else {
+    result.localMedianSyncRatio = 0.5 * (sortedSync[DISC_QUAD_BLOCKS / 2 - 1] +
+                                         sortedSync[DISC_QUAD_BLOCKS / 2]);
+  }
+  result.localGoodBlocks = 0;
+  for (uint8_t i = 0; i < DISC_QUAD_BLOCKS; i++) {
+    if (blockSync[i] >= DISC_LOCAL_GOOD_BLOCK_SYNC) result.localGoodBlocks++;
+  }
+
+  // ------------------------------------------------------------------------
+  // Long-record phase progression.  This remains the stability test: a real
+  // candidate may drift slowly, but the unwrapped block phase should still be
+  // well described by a near-linear trend.  Large/random residuals are rejected.
+  // ------------------------------------------------------------------------
+  double unwrapped[DISC_QUAD_BLOCKS];
+  unwrapped[0] = blockPhase[0];
+  for (uint8_t block = 1; block < DISC_QUAD_BLOCKS; block++) {
+    double d = blockPhase[block] - blockPhase[block - 1];
+    while (d > PI) d -= KK_TWO_PI;
+    while (d < -PI) d += KK_TWO_PI;
+    unwrapped[block] = unwrapped[block - 1] + d;
+  }
+
+  double blockDuration = static_cast<double>(DISC_QUAD_BLOCK_N) / SAMPLE_RATE_HZ;
+  double meanT = 0.0, meanP = 0.0, meanA = 0.0;
+  for (uint8_t block = 0; block < DISC_QUAD_BLOCKS; block++) {
+    double t = (static_cast<double>(block) + 0.5) * blockDuration;
+    meanT += t;
+    meanP += unwrapped[block];
+    meanA += blockAmplitude[block];
+  }
+  meanT /= static_cast<double>(DISC_QUAD_BLOCKS);
+  meanP /= static_cast<double>(DISC_QUAD_BLOCKS);
+  meanA /= static_cast<double>(DISC_QUAD_BLOCKS);
+
+  double cov = 0.0, var = 0.0;
+  for (uint8_t block = 0; block < DISC_QUAD_BLOCKS; block++) {
+    double t = (static_cast<double>(block) + 0.5) * blockDuration;
+    cov += (t - meanT) * (unwrapped[block] - meanP);
+    var += (t - meanT) * (t - meanT);
+  }
+  double phaseSlope = var > 0.0 ? cov / var : 0.0;
+  result.correctionHz = phaseSlope / KK_TWO_PI;
+  result.refinedHz = referenceHz + result.correctionHz;
+  result.amplitudeMs2 = meanA;
+
+  double rss = 0.0;
+  for (uint8_t block = 0; block < DISC_QUAD_BLOCKS; block++) {
+    double t = (static_cast<double>(block) + 0.5) * blockDuration;
+    double fit = meanP + phaseSlope * (t - meanT);
+    double r = unwrapped[block] - fit;
+    rss += r * r;
+  }
+  result.phaseFitRmseDeg = sqrt(rss / static_cast<double>(DISC_QUAD_BLOCKS)) * 180.0 / PI;
+
+  // ------------------------------------------------------------------------
+  // Whole-record synchronous ratio is retained for reporting only.  It is
+  // intentionally NOT used as the V1.3 primary gate because it is sensitive
+  // to frequency/phase wander across the full ~1.6 s record.
+  // ------------------------------------------------------------------------
+  double recordMean = 0.0;
+  for (uint16_t i = 0; i < DISC_QUAD_N; i++) recordMean += static_cast<double>(samples[i]);
+  recordMean /= static_cast<double>(DISC_QUAD_N);
+
+  double I = 0.0, Q = 0.0, sumSq = 0.0, windowSum = 0.0;
+  for (uint16_t i = 0; i < DISC_QUAD_N; i++) {
+    double centered = (static_cast<double>(samples[i]) - recordMean) * ADXL_MS2_PER_LSB;
+    sumSq += centered * centered;
+    double w = 0.5 - 0.5 * cos(KK_TWO_PI * static_cast<double>(i) /
+                               static_cast<double>(DISC_QUAD_N - 1));
+    double theta = KK_TWO_PI * referenceHz * static_cast<double>(i) / SAMPLE_RATE_HZ;
+    I += centered * w * cos(theta);
+    Q += centered * w * sin(theta);
+    windowSum += w;
+  }
+  double fullAmp = windowSum > 0.0 ? 2.0 * sqrt(I * I + Q * Q) / windowSum : 0.0;
+  result.phaseDeg = wrapDegrees(atan2(-Q, I) * 180.0 / PI);
+  double totalRms = sqrt(sumSq / static_cast<double>(DISC_QUAD_N));
+  double synchronousRms = fullAmp / sqrt(2.0);
+  result.syncRatio = totalRms > 1.0e-12 ? synchronousRms / totalRms : 0.0;
+  result.syncRatio = clampDouble(result.syncRatio, 0.0, 1.0);
+
+  result.valid = result.amplitudeMs2 >= DISC_MIN_SIGNAL_AMPLITUDE_MS2 &&
+                 fabs(result.correctionHz) <= DISC_QUAD_MAX_CORRECTION_HZ &&
+                 result.phaseFitRmseDeg <= DISC_QUAD_MAX_PHASE_RMSE_DEG &&
+                 result.localMedianSyncRatio >= DISC_LOCAL_AXIS_MIN_MEDIAN_SYNC &&
+                 result.localGoodBlocks >= DISC_LOCAL_MIN_GOOD_BLOCKS;
+  return result;
+}
+
+DiscoverySensorAtF0 discAnalyzeSensorAtFrequency(const int16_t x[], const int16_t y[],
+                                                 const int16_t z[], double fHz) {
+  DiscoverySensorAtF0 result = {};
+  result.axis[0] = discAnalyzeAxisQuadrature(x, fHz);
+  result.axis[1] = discAnalyzeAxisQuadrature(y, fHz);
+  result.axis[2] = discAnalyzeAxisQuadrature(z, fHz);
+  double ax = result.axis[0].amplitudeMs2;
+  double ay = result.axis[1].amplitudeMs2;
+  double az = result.axis[2].amplitudeMs2;
+  result.J = ax * ax + ay * ay + az * az;
+  result.vectorAmplitudeMs2 = sqrt(result.J);
+  return result;
+}
+
+double discWeightedCorrection(const DiscoverySensorAtF0 &sensor) {
+  double sumW = 0.0, sum = 0.0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    const DiscoveryAxisQuadResult &q = sensor.axis[axis];
+    if (q.amplitudeMs2 < DISC_MIN_SIGNAL_AMPLITUDE_MS2) continue;
+    if (q.phaseFitRmseDeg > DISC_QUAD_MAX_PHASE_RMSE_DEG) continue;
+    if (fabs(q.correctionHz) > DISC_QUAD_MAX_CORRECTION_HZ) continue;
+    double w = q.amplitudeMs2 * q.amplitudeMs2 * fmax(q.localMedianSyncRatio, 0.10);
+    sumW += w;
+    sum += w * q.correctionHz;
+  }
+  return sumW > 0.0 ? sum / sumW : 0.0;
+}
+
+double discWeightedSync(const DiscoverySensorAtF0 &sensor) {
+  double sumW = 0.0, sum = 0.0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    double w = sensor.axis[axis].amplitudeMs2 * sensor.axis[axis].amplitudeMs2;
+    sumW += w;
+    sum += w * sensor.axis[axis].syncRatio;
+  }
+  return sumW > 0.0 ? sum / sumW : 0.0;
+}
+
+double discWeightedLocalSync(const DiscoverySensorAtF0 &sensor) {
+  double sumW = 0.0, sum = 0.0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    double w = sensor.axis[axis].amplitudeMs2 * sensor.axis[axis].amplitudeMs2;
+    sumW += w;
+    sum += w * sensor.axis[axis].localMedianSyncRatio;
+  }
+  return sumW > 0.0 ? sum / sumW : 0.0;
+}
+
+double discWeightedPhaseRmse(const DiscoverySensorAtF0 &sensor) {
+  double sumW = 0.0, sum = 0.0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    double w = sensor.axis[axis].amplitudeMs2 * sensor.axis[axis].amplitudeMs2;
+    sumW += w;
+    sum += w * sensor.axis[axis].phaseFitRmseDeg;
+  }
+  return sumW > 0.0 ? sum / sumW : 999.0;
+}
+
+uint8_t discCountSupportAxes(const DiscoverySensorAtF0 &sensor) {
+  uint8_t count = 0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    const DiscoveryAxisQuadResult &q = sensor.axis[axis];
+    if (q.amplitudeMs2 >= DISC_MIN_SIGNAL_AMPLITUDE_MS2 &&
+        q.localMedianSyncRatio >= DISC_SUPPORT_AXIS_MIN_LOCAL_SYNC &&
+        q.localGoodBlocks >= DISC_LOCAL_MIN_GOOD_BLOCKS &&
+        q.phaseFitRmseDeg <= DISC_QUAD_MAX_PHASE_RMSE_DEG &&
+        fabs(q.correctionHz) <= DISC_QUAD_MAX_CORRECTION_HZ) {
+      count++;
+    }
+  }
+  return count;
+}
+
+bool discAxisFftSupportsFrequency(const DiscoveryAxisFFTResult &a, double fHz) {
+  return a.valid && fabs(a.frequencyHz - fHz) <= DISC_FREQ_CONSENSUS_TOL_HZ;
+}
+
+uint8_t discCountFftConsensusAxes(const DiscoverySensorFFTResult &sensor, double fHz) {
+  uint8_t count = 0;
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    if (discAxisFftSupportsFrequency(sensor.axis[axis], fHz)) count++;
+  }
+  return count;
+}
+
+void discValidateCandidate(DiscoveryCandidate &c) {
+  if (!c.fftValid) {
+    c.quadValid = false;
+    return;
+  }
+
+  DiscoverySensorAtF0 pass1 = discAnalyzeSensorAtFrequency(discToolX, discToolY, discToolZ, c.fftSeedHz);
+  double df1 = clampDouble(discWeightedCorrection(pass1),
+                           -DISC_QUAD_MAX_CORRECTION_HZ, DISC_QUAD_MAX_CORRECTION_HZ);
+  double f1 = c.fftSeedHz + df1;
+  DiscoverySensorAtF0 pass2 = discAnalyzeSensorAtFrequency(discToolX, discToolY, discToolZ, f1);
+  double df2 = clampDouble(discWeightedCorrection(pass2),
+                           -DISC_QUAD_MAX_CORRECTION_HZ, DISC_QUAD_MAX_CORRECTION_HZ);
+  double totalDf = clampDouble(df1 + df2,
+                               -DISC_QUAD_MAX_CORRECTION_HZ, DISC_QUAD_MAX_CORRECTION_HZ);
+  c.refinedHz = c.fftSeedHz + totalDf;
+
+  c.toolAtCandidate = discAnalyzeSensorAtFrequency(discToolX, discToolY, discToolZ, c.refinedHz);
+  c.handAtCandidate = discAnalyzeSensorAtFrequency(discHandX, discHandY, discHandZ, c.refinedHz);
+  c.toolVectorAmplitudeMs2 = c.toolAtCandidate.vectorAmplitudeMs2;
+  c.handVectorAmplitudeMs2 = c.handAtCandidate.vectorAmplitudeMs2;
+  c.toolWeightedSync = discWeightedSync(c.toolAtCandidate);                 // diagnostic
+  c.toolWeightedLocalSync = discWeightedLocalSync(c.toolAtCandidate);       // V1.3 gate
+  c.toolWeightedPhaseRmseDeg = discWeightedPhaseRmse(c.toolAtCandidate);
+  c.supportAxes = discCountSupportAxes(c.toolAtCandidate);
+  c.toolFrequencyConsensusAxes = discCountFftConsensusAxes(discoveryToolFFT, c.refinedHz);
+  c.handFrequencyConsensusAxes = discCountFftConsensusAxes(discoveryHandFFT, c.refinedHz);
+  uint8_t totalConsensus = c.toolFrequencyConsensusAxes + c.handFrequencyConsensusAxes;
+
+  c.quadValid = c.toolVectorAmplitudeMs2 >= DISC_MIN_SIGNAL_AMPLITUDE_MS2 &&
+                c.toolWeightedLocalSync >= DISC_LOCAL_AXIS_MIN_MEDIAN_SYNC &&
+                c.toolWeightedPhaseRmseDeg <= DISC_QUAD_MAX_PHASE_RMSE_DEG &&
+                c.supportAxes >= 1 &&
+                c.toolFrequencyConsensusAxes >= DISC_MIN_TOOL_FREQ_CONSENSUS_AXES &&
+                totalConsensus >= DISC_MIN_TOTAL_FREQ_CONSENSUS_AXES;
+
+  double syncFactor = 0.5 + 0.5 * clampDouble(c.toolWeightedLocalSync, 0.0, 1.0);
+  double supportFactor = 0.7 + 0.15 * static_cast<double>(c.supportAxes);
+  double consensusFactor = 0.70 + 0.10 * static_cast<double>(totalConsensus);
+  double stabilityFactor = 1.0 / (1.0 + c.toolWeightedPhaseRmseDeg / 30.0);
+  double snrFactor = clampDouble((c.fftSnrDb - 3.0) / 17.0, 0.35, 1.20);
+  c.qualityScore = c.quadValid
+      ? c.toolVectorAmplitudeMs2 * syncFactor * supportFactor * consensusFactor *
+        stabilityFactor * snrFactor
+      : 0.0;
+}
+
+bool discAcquireQuadratureRecord() {
+  if (!verifyBothIntegratedSensorsOrRecover()) return false;
+  Serial.print("Acquiring uninterrupted "); Serial.print(DISC_QUAD_N); Serial.println("-sample paired quadrature record...");
+  DiscoveryTiming t = discAcquirePairedRecord(DISC_QUAD_N);
+  Serial.print("Quadrature acquisition: "); Serial.print(t.elapsedUs / 1000.0, 2);
+  Serial.print(" ms | mean tool->hand read separation "); Serial.print(t.meanReadSeparationUs, 2);
+  Serial.print(" us | late samples "); Serial.print(t.lateSampleCount);
+  Serial.print(" | zero triplets "); Serial.print(t.zeroTriplets);
+  Serial.print(" | clipped samples "); Serial.println(t.clippedSamples);
+  if (!t.valid) {
+    Serial.println("QUADRATURE RECORD REJECTED: acquisition integrity gate failed.");
+    return false;
+  }
+  return true;
+}
+
+void discPrintIndependentPeaks(const char *title, const DiscoverySensorFFTResult &r) {
+  Serial.println();
+  Serial.println(title);
+  Serial.println("AXIS   DOMINANT PEAK       FFT AMP (peak)     SNR       STATUS");
+  Serial.println("---------------------------------------------------------------");
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    const DiscoveryAxisFFTResult &a = r.axis[axis];
+    Serial.print(discAxisName(axis)); Serial.print("      ");
+    Serial.print(a.frequencyHz, 3); Serial.print(" Hz        ");
+    Serial.print(a.amplitudeMs2, 5); Serial.print(" m/s2      ");
+    Serial.print(a.snrDb, 1); Serial.print(" dB     ");
+    Serial.println(a.valid ? "VALID" : "LOW CONF");
+  }
+}
+
+void discPrintCandidateTable() {
+  Serial.println();
+  Serial.println("ADXL1 TOOL - HARD-CODED 240..320 Hz TRIAXIAL CANDIDATES");
+  Serial.println("N  FFTseed  SNR   Refined   ToolAmp  FullSync  LocalSync  RMSE  Sup  FconsT/H  HandAmp  Score");
+  Serial.println("------------------------------------------------------------------------------------------------");
+  for (uint8_t i = 0; i < discoveryCandidateCount; i++) {
+    DiscoveryCandidate &c = discoveryCandidates[i];
+    Serial.print(i + 1); Serial.print("  ");
+    Serial.print(c.fftSeedHz, 3); Serial.print("  ");
+    Serial.print(c.fftSnrDb, 1); Serial.print("  ");
+    Serial.print(c.refinedHz, 4); Serial.print("  ");
+    Serial.print(c.toolVectorAmplitudeMs2, 4); Serial.print("   ");
+    Serial.print(c.toolWeightedSync, 3); Serial.print("     ");
+    Serial.print(c.toolWeightedLocalSync, 3); Serial.print("      ");
+    Serial.print(c.toolWeightedPhaseRmseDeg, 1); Serial.print("   ");
+    Serial.print(c.supportAxes); Serial.print("    ");
+    Serial.print(c.toolFrequencyConsensusAxes); Serial.print("/");
+    Serial.print(c.handFrequencyConsensusAxes); Serial.print("      ");
+    Serial.print(c.handVectorAmplitudeMs2, 4); Serial.print("   ");
+    Serial.print(c.qualityScore, 4);
+    if (!c.quadValid) Serial.print("  LOW_CONF");
+    Serial.println();
+  }
+  Serial.println("FullSync = old whole-record diagnostic; LocalSync = median of 10 short-block sync ratios.");
+  Serial.println("FconsT/H = number of independent ADXL1/ADXL2 FFT axis peaks agreeing with the candidate.");
+}
+
+void discPrintSensorAtF0(const char *title, const DiscoverySensorFFTResult &fft,
+                         const DiscoverySensorAtF0 &q, double f0) {
+  Serial.println();
+  Serial.println(title);
+  Serial.print("COMMON CONTROL f0 = "); Serial.print(f0, 6); Serial.println(" Hz");
+  Serial.println("AXIS   LOCAL DOM PEAK      AMPLITUDE @ f0      PHASE@f0   FullSync  LocalSync  GoodBlk  STATUS");
+  Serial.println("------------------------------------------------------------------------------------------------");
+  for (uint8_t axis = 0; axis < 3; axis++) {
+    Serial.print(discAxisName(axis)); Serial.print("      ");
+    Serial.print(fft.axis[axis].frequencyHz, 3); Serial.print(" Hz        ");
+    Serial.print(q.axis[axis].amplitudeMs2, 5); Serial.print(" m/s2      ");
+    Serial.print(q.axis[axis].phaseDeg, 1); Serial.print(" deg     ");
+    Serial.print(q.axis[axis].syncRatio, 3); Serial.print("     ");
+    Serial.print(q.axis[axis].localMedianSyncRatio, 3); Serial.print("      ");
+    Serial.print(q.axis[axis].localGoodBlocks); Serial.print("/10     ");
+    Serial.println(q.axis[axis].valid ? "VALID" : "LOW CONF");
+  }
+  Serial.print("Vector amplitude @ f0 = "); Serial.print(q.vectorAmplitudeMs2, 5); Serial.println(" m/s2");
+  Serial.print("J @ f0 = "); Serial.print(q.J, 6); Serial.println(" (m/s2)^2");
+}
+
+int discBestCandidateIndexByScore() {
+  int best = -1;
+  double bestScore = 0.0;
+  for (uint8_t i = 0; i < discoveryCandidateCount; i++) {
+    if (discoveryCandidates[i].quadValid && discoveryCandidates[i].qualityScore > bestScore) {
+      bestScore = discoveryCandidates[i].qualityScore;
+      best = i;
+    }
+  }
+  return best;
+}
+
+int discSecondBestCandidateIndexByScore(int best) {
+  int second = -1;
+  double secondScore = 0.0;
+  for (uint8_t i = 0; i < discoveryCandidateCount; i++) {
+    if (static_cast<int>(i) == best) continue;
+    if (discoveryCandidates[i].quadValid && discoveryCandidates[i].qualityScore > secondScore) {
+      secondScore = discoveryCandidates[i].qualityScore;
+      second = i;
+    }
+  }
+  return second;
+}
+
+void applyIntegratedBaseline(uint8_t candidateIndex) {
+  DiscoveryCandidate &c = discoveryCandidates[candidateIndex];
+  baselineF0Hz = c.refinedHz;
+  baselineToolAtF0 = c.toolAtCandidate;
+  baselineHandAtF0 = c.handAtCandidate;
+  baselineValid = true;
+  baselineAxisSelected = false;
+  quickDacSweepDone = false;
+  for (uint8_t i = 0; i < QUICK_DAC_POINT_COUNT; i++) quickDacPoints[i] = {};
+  for (uint8_t a = 0; a < 3; a++) {
+    quickAxisReachable[a] = false;
+    quickAxisEstimatedDac[a] = 0.0;
+  }
+  integratedWorkflowState = IntegratedWorkflowState::AWAIT_AXIS;
+
+  Serial.println();
+  Serial.println("====================================================================");
+  Serial.println("NARROWBAND TOOL FREQUENCY ACCEPTED");
+  Serial.print("f0 = "); Serial.print(baselineF0Hz, 6); Serial.println(" Hz");
+  Serial.println("This f0 is common to the later amplitude matcher and phase sweep.");
+  Serial.println("====================================================================");
+  discPrintSensorAtF0("ADXL1 TOOL / REFERENCE", discoveryToolFFT, baselineToolAtF0, baselineF0Hz);
+  discPrintSensorAtF0("ADXL2 BACK-OF-HAND / ERROR SENSOR", discoveryHandFFT, baselineHandAtF0, baselineF0Hz);
+
+  Serial.println();
+  Serial.println("CSV_BASELINE,f0_Hz,ADXL1_X,ADXL1_Y,ADXL1_Z,ADXL2_X,ADXL2_Y,ADXL2_Z");
+  Serial.print("CSV_BASELINE,"); Serial.print(baselineF0Hz, 6); Serial.print(",");
+  Serial.print(baselineToolAtF0.axis[0].amplitudeMs2, 6); Serial.print(",");
+  Serial.print(baselineToolAtF0.axis[1].amplitudeMs2, 6); Serial.print(",");
+  Serial.print(baselineToolAtF0.axis[2].amplitudeMs2, 6); Serial.print(",");
+  Serial.print(baselineHandAtF0.axis[0].amplitudeMs2, 6); Serial.print(",");
+  Serial.print(baselineHandAtF0.axis[1].amplitudeMs2, 6); Serial.print(",");
+  Serial.println(baselineHandAtF0.axis[2].amplitudeMs2, 6);
+
+  Serial.println();
+  Serial.println("NEXT: choose the ADXL2 error-sensor axis with x / y / z.");
+  Serial.println("For normal FxLMS, d and c are OPTIONAL. After axis selection: TOOL OFF -> i.");
+  Serial.println("Optional diagnostics remain available: TOOL OFF -> d, and/or c after axis selection.");
+}
+
+
+// ============================================================================
+// QUICK TRIAXIAL ACTUATOR AUTHORITY SWEEP (BEFORE AXIS SELECTION)
+// ============================================================================
+
+double phaseWrap360(double degrees) {
+  while (degrees >= 360.0) degrees -= 360.0;
+  while (degrees < 0.0) degrees += 360.0;
+  return degrees;
+}
+
+QuickDacPoint measureQuickDacPoint(double dac) {
+  QuickDacPoint p = {};
+  p.dac = quantizeDac(dac);
+
+  if (!setVisatonAmplitudeContinuous(p.dac)) return p;
+  if (!interruptibleDelay(QUICK_DAC_SETTLE_MS)) return p;
+
+  WindowResult w[QUICK_DAC_WINDOWS];
+  for (uint8_t i = 0; i < QUICK_DAC_WINDOWS; i++) {
+    w[i] = acquireWindow(QUICK_DAC_WINDOW_SAMPLES);
+    if (!w[i].valid || w[i].communicationFault || w[i].rawClipped) return p;
+
+    for (uint8_t a = 0; a < 3; a++) {
+      if (w[i].axis[a].amplitudeMs2 > PHASE_AXIS_ABORT_MS2) {
+        stopVisaton();
+        return p;
+      }
+    }
+    if (w[i].totalAmplitudeMs2 > PHASE_VECTOR_ABORT_MS2) {
+      stopVisaton();
+      return p;
+    }
+
+    if (i + 1 < QUICK_DAC_WINDOWS &&
+        !interruptibleDelay(QUICK_DAC_WINDOW_GAP_MS)) return p;
+  }
+
+  bool anyAxis = false;
+  for (uint8_t a = 0; a < 3; a++) {
+    double v[QUICK_DAC_WINDOWS];
+    double syncSum = 0.0;
+    for (uint8_t i = 0; i < QUICK_DAC_WINDOWS; i++) {
+      v[i] = w[i].axis[a].amplitudeMs2;
+      syncSum += w[i].axis[a].syncRatio;
+    }
+    double mean = meanSmall(v, QUICK_DAC_WINDOWS);
+    double sd = sampleSdSmall(v, QUICK_DAC_WINDOWS, mean);
+    p.axisMeanMs2[a] = mean;
+    p.axisCvPercent[a] = mean > 1.0e-12 ? 100.0 * sd / mean : 999.0;
+    p.axisSync[a] = syncSum / QUICK_DAC_WINDOWS;
+    if (mean >= MIN_REPORT_AMPLITUDE_MS2 &&
+        p.axisCvPercent[a] <= QUICK_DAC_MAX_CV_PERCENT) anyAxis = true;
+  }
+  p.vectorMeanMs2 = sqrt(p.axisMeanMs2[0] * p.axisMeanMs2[0] +
+                         p.axisMeanMs2[1] * p.axisMeanMs2[1] +
+                         p.axisMeanMs2[2] * p.axisMeanMs2[2]);
+  p.valid = anyAxis;
+  return p;
+}
+
+void analyseQuickAxisReachability() {
+  for (uint8_t a = 0; a < 3; a++) {
+    quickAxisReachable[a] = false;
+    quickAxisEstimatedDac[a] = 0.0;
+    double target = baselineHandAtF0.axis[a].amplitudeMs2;
+    if (!baselineHandAtF0.axis[a].valid || target < MIN_REPORT_AMPLITUDE_MS2) continue;
+
+    double bestErr = 1.0e99;
+    double bestDac = 0.0;
+    for (uint8_t i = 0; i < QUICK_DAC_POINT_COUNT; i++) {
+      const QuickDacPoint &p = quickDacPoints[i];
+      if (!p.valid || p.axisCvPercent[a] > QUICK_DAC_MAX_CV_PERCENT) continue;
+      double err = fabs(p.axisMeanMs2[a] - target);
+      if (err < bestErr) {
+        bestErr = err;
+        bestDac = p.dac;
+      }
+    }
+
+    // Prefer a stable adjacent sign crossing. This is only a rough authority
+    // estimate; V5.1R still performs the real same-DAC validated root search.
+    for (uint8_t i = 0; i + 1 < QUICK_DAC_POINT_COUNT; i++) {
+      const QuickDacPoint &lo = quickDacPoints[i];
+      const QuickDacPoint &hi = quickDacPoints[i + 1];
+      if (!lo.valid || !hi.valid) continue;
+      if (lo.axisCvPercent[a] > QUICK_DAC_MAX_CV_PERCENT ||
+          hi.axisCvPercent[a] > QUICK_DAC_MAX_CV_PERCENT) continue;
+      double y0 = lo.axisMeanMs2[a];
+      double y1 = hi.axisMeanMs2[a];
+      if ((target - y0) * (target - y1) > 0.0) continue;
+      if (fabs(y1 - y0) < 1.0e-6) continue;
+      double frac = (target - y0) / (y1 - y0);
+      quickAxisEstimatedDac[a] = clampDouble(lo.dac + frac * (hi.dac - lo.dac), lo.dac, hi.dac);
+      quickAxisReachable[a] = true;
+      break;
+    }
+
+    // A direct point already within +/-5% also counts as reachable.
+    if (!quickAxisReachable[a] && target > 1.0e-12 && bestDac > 0.0 &&
+        100.0 * bestErr / target <= ACCEPTED_BAND_PERCENT) {
+      quickAxisReachable[a] = true;
+      quickAxisEstimatedDac[a] = bestDac;
+    }
+  }
+}
+
+void runQuickDacAuthoritySweep() {
+  if (!baselineValid ||
+      (integratedWorkflowState != IntegratedWorkflowState::AWAIT_AXIS &&
+       integratedWorkflowState != IntegratedWorkflowState::AWAIT_TOOL_OFF)) {
+    Serial.println("Quick DAC sweep requires a valid Stage-A baseline and no active controller. Run TOOL ON -> a first.");
+    return;
+  }
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("QUICK TRIAXIAL VISATON AUTHORITY SWEEP");
+  Serial.println("TOOL MUST BE OFF. VISATON ONLY. Wearable/mount/knob position must stay fixed.");
+  Serial.print("Common frequency f0: "); Serial.print(baselineF0Hz, 6); Serial.println(" Hz");
+  Serial.println("Sparse DAC levels: 5, 9, 13, 17, 21, 25, 29");
+  Serial.println("Two simultaneous 256-sample triaxial windows per DAC; CV <= 8% is treated as stable.");
+  Serial.println("This is a fast authority diagnostic, NOT a replacement for V5.1R matching.");
+  Serial.println("================================================================================");
+  Serial.println("CSV_QUICK_DAC_HEADER,DAC,X,Y,Z,X_CV_pct,Y_CV_pct,Z_CV_pct,X_Sync,Y_Sync,Z_Sync,X_Stable,Y_Stable,Z_Stable,Vector,SensorValid");
+
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  testFrequencyHz = baselineF0Hz;
+  stopVisaton();
+  startVisatonInitial(testFrequencyHz, QUICK_DAC_LEVELS[0]);
+
+  for (uint8_t i = 0; i < QUICK_DAC_POINT_COUNT; i++) {
+    if (checkEmergencyStop()) break;
+    QuickDacPoint p = measureQuickDacPoint(QUICK_DAC_LEVELS[i]);
+    quickDacPoints[i] = p;
+
+    Serial.print("QUICK_DAC "); Serial.print(p.dac, 2); Serial.print(" | X/Y/Z ");
+    if (p.valid) {
+      Serial.print(p.axisMeanMs2[0], 5); Serial.print(" / ");
+      Serial.print(p.axisMeanMs2[1], 5); Serial.print(" / ");
+      Serial.print(p.axisMeanMs2[2], 5);
+      Serial.print(" | CV ");
+      Serial.print(p.axisCvPercent[0], 2); Serial.print(" / ");
+      Serial.print(p.axisCvPercent[1], 2); Serial.print(" / ");
+      Serial.print(p.axisCvPercent[2], 2);
+      Serial.print(" % | Sync ");
+      Serial.print(p.axisSync[0], 3); Serial.print(" / ");
+      Serial.print(p.axisSync[1], 3); Serial.print(" / ");
+      Serial.print(p.axisSync[2], 3);
+      Serial.print(" | Vector "); Serial.println(p.vectorMeanMs2, 5);
+    } else {
+      Serial.println("INVALID / UNSTABLE");
+    }
+
+    Serial.print("CSV_QUICK_DAC,"); Serial.print(p.dac, 2); Serial.print(",");
+    if (p.valid) {
+      Serial.print(p.axisMeanMs2[0], 6); Serial.print(",");
+      Serial.print(p.axisMeanMs2[1], 6); Serial.print(",");
+      Serial.print(p.axisMeanMs2[2], 6); Serial.print(",");
+      Serial.print(p.axisCvPercent[0], 3); Serial.print(",");
+      Serial.print(p.axisCvPercent[1], 3); Serial.print(",");
+      Serial.print(p.axisCvPercent[2], 3); Serial.print(",");
+      Serial.print(p.axisSync[0], 4); Serial.print(",");
+      Serial.print(p.axisSync[1], 4); Serial.print(",");
+      Serial.print(p.axisSync[2], 4); Serial.print(",");
+      Serial.print(p.axisCvPercent[0] <= QUICK_DAC_MAX_CV_PERCENT ? 1 : 0); Serial.print(",");
+      Serial.print(p.axisCvPercent[1] <= QUICK_DAC_MAX_CV_PERCENT ? 1 : 0); Serial.print(",");
+      Serial.print(p.axisCvPercent[2] <= QUICK_DAC_MAX_CV_PERCENT ? 1 : 0); Serial.print(",");
+      Serial.print(p.vectorMeanMs2, 6); Serial.println(",1");
+    } else {
+      Serial.println("NA,NA,NA,NA,NA,NA,NA,NA,NA,0,0,0,NA,0");
+    }
+  }
+
+  stopVisaton();
+  automaticTestRunning = false;
+  if (emergencyStopRequested) return;
+
+  analyseQuickAxisReachability();
+  quickDacSweepDone = true;
+
+  Serial.println();
+  Serial.println("---------------- QUICK AUTHORITY / TARGET SUMMARY ----------------");
+  Serial.println("Axis  Stage-A hand target    Stable actuator bracket?    Estimated DAC");
+  for (uint8_t a = 0; a < 3; a++) {
+    char ac = a == 0 ? 'X' : (a == 1 ? 'Y' : 'Z');
+    Serial.print(ac); Serial.print("     ");
+    if (!baselineHandAtF0.axis[a].valid ||
+        baselineHandAtF0.axis[a].amplitudeMs2 < MIN_REPORT_AMPLITUDE_MS2) {
+      Serial.println("LOW-CONF TARGET           NO                      --");
+      continue;
+    }
+    Serial.print(baselineHandAtF0.axis[a].amplitudeMs2, 6); Serial.print("              ");
+    if (quickAxisReachable[a]) {
+      Serial.print("YES                     ");
+      Serial.println(quickAxisEstimatedDac[a], 2);
+    } else {
+      Serial.println("NOT PROVEN              --");
+    }
+  }
+  Serial.println("------------------------------------------------------------------");
+  if (baselineAxisSelected) {
+    Serial.println("Axis was already selected. d was diagnostic only; TOOL OFF -> i for FxLMS, or c for optional V5.1R matching.");
+  } else {
+    Serial.println("Now choose x / y / z manually. d is diagnostic only; c is optional for FxLMS.");
+  }
+}
+
+// ============================================================================
+// INTEGRATED STAGE C - V2.0 TOOL-REFERENCED PHASE TRACKING
+// ============================================================================
+
+char axisCharFromIndex(uint8_t a) {
+  return a == 0 ? 'X' : (a == 1 ? 'Y' : 'Z');
+}
+
+PairedTrackingWindow acquirePairedTrackingWindow(uint16_t sampleCount) {
+  PairedTrackingWindow out = {};
+  if (sampleCount < 32 || sampleCount > FFT_SAMPLES) return out;
+  if (!verifyBothIntegratedSensorsOrRecover()) {
+    out.communicationFault = true;
+    return out;
+  }
+
+  uint32_t nextSampleUs = micros();
+  uint32_t startUs = nextSampleUs;
+  uint16_t zeroTriplets = 0;
+  uint16_t clippedSamples = 0;
+
+  for (uint16_t i = 0; i < sampleCount; i++) {
+    while (static_cast<int32_t>(micros() - nextSampleUs) < 0) {
+      if (checkEmergencyStop()) return out;
+    }
+    uint32_t actualUs = micros();
+    uint32_t lateness = actualUs - nextSampleUs;
+    if (lateness > out.maxLatenessUs) out.maxLatenessUs = lateness;
+    if (lateness > TRACK_LATE_SAMPLE_WARNING_US) out.lateSamples++;
+    nextSampleUs += SAMPLE_PERIOD_US;
+
+    uint32_t baseWord, offsetWord;
+    noInterrupts();
+    baseWord = visatonPhaseAccumulator;
+    offsetWord = visatonPhaseOffsetCurrent;
+    interrupts();
+    phaseReference[i] = baseWord;
+    phaseOffsetReference[i] = offsetWord;
+
+    RawAcceleration tool = dualReadRawXYZ(PIN_CS_ADXL1);
+    RawAcceleration hand = dualReadRawXYZ(PIN_CS_ADXL2);
+    discToolX[i] = tool.x; discToolY[i] = tool.y; discToolZ[i] = tool.z;
+    discHandX[i] = hand.x; discHandY[i] = hand.y; discHandZ[i] = hand.z;
+
+    if (discRawTripletZero(tool)) zeroTriplets++;
+    if (discRawTripletZero(hand)) zeroTriplets++;
+    if (discRawTripletClipped(tool)) clippedSamples++;
+    if (discRawTripletClipped(hand)) clippedSamples++;
+  }
+
+  uint32_t elapsedUs = micros() - startUs;
+  out.centerUs = startUs + elapsedUs / 2U;
+  out.commandOffsetMidDeg = phaseWordToDegreesSigned(phaseOffsetReference[sampleCount / 2]);
+  out.rawClipped = clippedSamples > 0;
+  out.timingFault = out.lateSamples > TRACK_MAX_LATE_SAMPLES;
+
+  if (!verifyReferenceAdxl1(false) || !verifyAdxl2(false) ||
+      zeroTriplets > DISC_MAX_ZERO_TRIPLETS_PER_RECORD) {
+    out.communicationFault = true;
+  }
+
+  calculateSyncAxis(discToolX, phaseReference, sampleCount, out.toolAxis[0]);
+  calculateSyncAxis(discToolY, phaseReference, sampleCount, out.toolAxis[1]);
+  calculateSyncAxis(discToolZ, phaseReference, sampleCount, out.toolAxis[2]);
+  calculateSyncAxis(discHandX, phaseReference, sampleCount, out.handAxis[0]);
+  calculateSyncAxis(discHandY, phaseReference, sampleCount, out.handAxis[1]);
+  calculateSyncAxis(discHandZ, phaseReference, sampleCount, out.handAxis[2]);
+
+  out.handVectorMs2 = sqrt(
+      out.handAxis[0].amplitudeMs2 * out.handAxis[0].amplitudeMs2 +
+      out.handAxis[1].amplitudeMs2 * out.handAxis[1].amplitudeMs2 +
+      out.handAxis[2].amplitudeMs2 * out.handAxis[2].amplitudeMs2);
+
+  out.valid = !out.communicationFault && !out.rawClipped && !out.timingFault;
+  return out;
+}
+
+bool choosePhaseReferenceAxis(bool printResult) {
+  double bestScore = -1.0;
+  int best = -1;
+
+  for (uint8_t a = 0; a < 3; a++) {
+    const DiscoveryAxisQuadResult &b = baselineToolAtF0.axis[a];
+    if (!b.valid || b.amplitudeMs2 < TRACK_MIN_TOOL_AMPLITUDE_MS2) continue;
+
+    double localSync = b.localMedianSyncRatio;
+    if (localSync < DISC_LOCAL_AXIS_MIN_MEDIAN_SYNC) continue;
+
+    double leakRatio = phaseReferenceLeakageValid ? phaseReferenceLeakRatio[a] : 0.0;
+    if (phaseReferenceLeakageValid && leakRatio > TRACK_MAX_REFERENCE_LEAK_RATIO) continue;
+
+    // Strong baseline + coherent reference + low actuator leakage is preferred.
+    double score = b.amplitudeMs2 * fmax(localSync, 0.10) / (1.0 + 3.0 * leakRatio);
+    if (score > bestScore) {
+      bestScore = score;
+      best = static_cast<int>(a);
+    }
+  }
+
+  phaseReferenceAxisValid = best >= 0;
+  if (phaseReferenceAxisValid) phaseReferenceAxis = static_cast<uint8_t>(best);
+
+  if (printResult) {
+    Serial.println();
+    Serial.println("---------------- PHASE REFERENCE SELECTION ----------------");
+    for (uint8_t a = 0; a < 3; a++) {
+      Serial.print("ADXL1 "); Serial.print(axisCharFromIndex(a));
+      Serial.print(" | Stage-A amp "); Serial.print(baselineToolAtF0.axis[a].amplitudeMs2, 6);
+      Serial.print(" | local sync "); Serial.print(baselineToolAtF0.axis[a].localMedianSyncRatio, 3);
+      if (phaseReferenceLeakageValid) {
+        Serial.print(" | actuator leakage "); Serial.print(phaseReferenceLeakageMs2[a], 6);
+        Serial.print(" | leakage ratio "); Serial.print(100.0 * phaseReferenceLeakRatio[a], 1); Serial.print(" %");
+      }
+      Serial.println();
+    }
+    if (phaseReferenceAxisValid) {
+      Serial.print("Selected live tool phase reference: ADXL1 ");
+      Serial.println(axisCharFromIndex(phaseReferenceAxis));
+      if (phaseReferenceLeakageValid) {
+        double r = phaseReferenceLeakRatio[phaseReferenceAxis];
+        Serial.print("Reference leakage classification: ");
+        Serial.println(r <= TRACK_GOOD_REFERENCE_LEAK_RATIO ? "GOOD" : "MARGINAL - allowed, interpret carefully");
+      }
+    } else {
+      Serial.println("NO ACCEPTABLE ADXL1 PHASE REFERENCE AXIS.");
+    }
+    Serial.println("-----------------------------------------------------------");
+  }
+  return phaseReferenceAxisValid;
+}
+
+bool measurePhaseReferenceLeakageAfterMatch() {
+  // Called immediately after c succeeds, while the operator-confirmed tool is OFF
+  // and the Visaton remains ON at the matched f0 + DAC.
+  phaseReferenceLeakageValid = false;
+  for (uint8_t a = 0; a < 3; a++) {
+    phaseReferenceLeakageMs2[a] = 0.0;
+    phaseReferenceLeakRatio[a] = 999.0;
+  }
+
+  const uint8_t records = 3;
+  double sum[3] = {0.0, 0.0, 0.0};
+  uint8_t valid = 0;
+  for (uint8_t k = 0; k < records; k++) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(TRACK_WINDOW_SAMPLES);
+    if (!w.valid) continue;
+    for (uint8_t a = 0; a < 3; a++) sum[a] += w.toolAxis[a].amplitudeMs2;
+    valid++;
+    if (k + 1 < records && !interruptibleDelay(30)) return false;
+  }
+  if (valid < 2) {
+    Serial.println("PHASE-REFERENCE LEAKAGE CHECK: insufficient valid paired windows.");
+    return false;
+  }
+
+  for (uint8_t a = 0; a < 3; a++) {
+    phaseReferenceLeakageMs2[a] = sum[a] / static_cast<double>(valid);
+    double base = baselineToolAtF0.axis[a].amplitudeMs2;
+    if (base > 1.0e-9) phaseReferenceLeakRatio[a] = phaseReferenceLeakageMs2[a] / base;
+  }
+  phaseReferenceLeakageValid = true;
+  choosePhaseReferenceAxis(true);
+  return phaseReferenceAxisValid;
+}
+
+bool liveReferenceWindowAcceptable(const PairedTrackingWindow &w, uint8_t refAxis) {
+  if (!w.valid) return false;
+  const AxisSyncResult &r = w.toolAxis[refAxis];
+  if (r.amplitudeMs2 < TRACK_MIN_TOOL_AMPLITUDE_MS2) return false;
+  if (r.syncRatio < TRACK_MIN_TOOL_SYNC) return false;
+
+  double base = baselineToolAtF0.axis[refAxis].amplitudeMs2;
+  if (base > 1.0e-9) {
+    double ratio = r.amplitudeMs2 / base;
+    if (ratio < TRACK_MIN_LIVE_TO_BASELINE_RATIO ||
+        ratio > TRACK_MAX_LIVE_TO_BASELINE_RATIO) return false;
+  }
+  return true;
+}
+
+bool updateToolPhaseTracker(PhaseTrackerState &tracker,
+                            const PairedTrackingWindow &w,
+                            double targetRelativePhaseDeg,
+                            double &trackingErrorDeg,
+                            double &predictedToolPhaseDeg) {
+  if (!liveReferenceWindowAcceptable(w, tracker.referenceAxis)) {
+    tracker.rejectedUpdates++;
+    return false;
+  }
+
+  double toolPhaseDeg = w.toolAxis[tracker.referenceAxis].phaseDeg;
+  if (!tracker.initialized) {
+    tracker.initialized = true;
+    tracker.lastToolPhaseDeg = toolPhaseDeg;
+    tracker.lastCenterUs = w.centerUs;
+    tracker.filteredFrequencyErrorHz = 0.0;
+  } else {
+    double dt = static_cast<double>(static_cast<uint32_t>(w.centerUs - tracker.lastCenterUs)) / 1.0e6;
+    if (dt > 0.02 && dt < 1.0) {
+      double dphi = wrapDegrees(toolPhaseDeg - tracker.lastToolPhaseDeg);
+      double instDf = dphi / (360.0 * dt);
+      if (fabs(instDf) <= TRACK_MAX_ABS_FREQ_ERROR_HZ) {
+        tracker.filteredFrequencyErrorHz =
+            (1.0 - TRACK_FREQ_LPF_ALPHA) * tracker.filteredFrequencyErrorHz +
+            TRACK_FREQ_LPF_ALPHA * instDf;
+      } else {
+        tracker.rejectedUpdates++;
+        return false;
+      }
+    }
+    tracker.lastToolPhaseDeg = toolPhaseDeg;
+    tracker.lastCenterUs = w.centerUs;
+  }
+
+  // The phase estimator represents approximately the centre of the 160 ms
+  // window. Predict it forward to 'now' using the measured tool/NCO slip rate.
+  double ageSec = static_cast<double>(static_cast<uint32_t>(micros() - w.centerUs)) / 1.0e6;
+  predictedToolPhaseDeg = wrapDegrees(
+      toolPhaseDeg + 360.0 * tracker.filteredFrequencyErrorHz * ageSec);
+
+  // command = sin(theta_NCO + psi), tool = sin(theta_NCO + phi_tool)
+  // therefore command - tool = beta when psi = phi_tool + beta.
+  double desiredOffsetDeg = phaseWrap360(predictedToolPhaseDeg + targetRelativePhaseDeg);
+  setVisatonPhaseOffsetTargetDeg(desiredOffsetDeg);
+
+  // Evaluate the physical command/tool relation that existed at the centre of
+  // THIS measured window. Only windows already close to beta are accepted for
+  // attenuation statistics; the update above prepares the next window.
+  double actualRelativeMidDeg = wrapDegrees(w.commandOffsetMidDeg - toolPhaseDeg);
+  trackingErrorDeg = wrapDegrees(actualRelativeMidDeg - targetRelativePhaseDeg);
+  tracker.validUpdates++;
+  return true;
+}
+
+bool initializeToolPhaseTracker(PhaseTrackerState &tracker, double &initialRelativePhaseDeg) {
+  tracker = {};
+  tracker.referenceAxis = phaseReferenceAxis;
+
+  uint8_t good = 0;
+  uint8_t attempts = 0;
+  double betaHold = 0.0;
+  while (good < 4 && attempts < 8) {
+    attempts++;
+    PairedTrackingWindow w = acquirePairedTrackingWindow(TRACK_WINDOW_SAMPLES);
+    if (!liveReferenceWindowAcceptable(w, tracker.referenceAxis)) continue;
+
+    if (good == 0) {
+      betaHold = wrapDegrees(w.commandOffsetMidDeg - w.toolAxis[tracker.referenceAxis].phaseDeg);
+    }
+
+    double err = 0.0, pred = 0.0;
+    if (!updateToolPhaseTracker(tracker, w, betaHold, err, pred)) continue;
+    good++;
+  }
+
+  if (good < 4) return false;
+  initialRelativePhaseDeg = betaHold;
+  return true;
+}
+
+TrackedPhasePoint measureTrackedPhasePoint(PhaseTrackerState &tracker,
+                                           double targetRelativePhaseDeg,
+                                           uint8_t requiredValidWindows,
+                                           bool verboseSamples) {
+  TrackedPhasePoint p = {};
+  p.targetRelativePhaseDeg = phaseWrap360(targetRelativePhaseDeg);
+  p.referenceAxis = tracker.referenceAxis;
+  p.selectedMinMs2 = 1.0e99;
+  p.selectedMaxMs2 = -1.0e99;
+  p.trackingErrorMaxAbsDeg = 0.0;
+
+  if (!visatonRunning) return p;
+
+  // First move the tracker to the new beta without using transition windows as
+  // attenuation evidence.
+  for (uint8_t k = 0; k < TRACK_WARMUP_WINDOWS_PER_POINT; k++) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(TRACK_WINDOW_SAMPLES);
+    double err = 0.0, pred = 0.0;
+    if (w.valid) updateToolPhaseTracker(tracker, w, p.targetRelativePhaseDeg, err, pred);
+    if (checkEmergencyStop()) return p;
+  }
+
+  double axisSamples[3][TRACK_FINAL_VALID_WINDOWS];
+  double vectorSamples[TRACK_FINAL_VALID_WINDOWS];
+  double selectedSamples[TRACK_FINAL_VALID_WINDOWS];
+  double errorSamples[TRACK_FINAL_VALID_WINDOWS];
+  double toolSyncSamples[TRACK_FINAL_VALID_WINDOWS];
+  double toolAmpSamples[TRACK_FINAL_VALID_WINDOWS];
+
+  uint8_t validCount = 0;
+  uint8_t consecutiveBad = 0;
+  uint8_t attempts = 0;
+  uint8_t maxAttempts = requiredValidWindows + TRACK_EXTRA_ATTEMPTS;
+
+  while (validCount < requiredValidWindows && attempts < maxAttempts) {
+    attempts++;
+    PairedTrackingWindow w = acquirePairedTrackingWindow(TRACK_WINDOW_SAMPLES);
+    double trackingError = 999.0;
+    double predictedToolPhase = 0.0;
+    bool trackerOk = w.valid && updateToolPhaseTracker(
+        tracker, w, p.targetRelativePhaseDeg, trackingError, predictedToolPhase);
+
+    if (!trackerOk) {
+      consecutiveBad++;
+      if (consecutiveBad >= TRACK_MAX_CONSECUTIVE_BAD_WINDOWS) {
+        Serial.println("TRACK ABORT: repeated invalid/low-quality ADXL1 phase-reference windows.");
+        return p;
+      }
+      continue;
+    }
+    consecutiveBad = 0;
+
+    // The tracking update has been issued for the next window. Only accept the
+    // current window if it was already physically close to the requested beta.
+    if (fabs(trackingError) > TRACK_ACCEPT_ERROR_DEG) continue;
+
+    bool ceiling = false;
+    for (uint8_t a = 0; a < 3; a++) {
+      if (w.handAxis[a].amplitudeMs2 > PHASE_AXIS_ABORT_MS2) ceiling = true;
+    }
+    if (w.handVectorMs2 > PHASE_VECTOR_ABORT_MS2) ceiling = true;
+    if (ceiling) {
+      stopVisaton();
+      Serial.println("TRACK ABORT: experimental acceleration ceiling exceeded.");
+      return p;
+    }
+
+    for (uint8_t a = 0; a < 3; a++) axisSamples[a][validCount] = w.handAxis[a].amplitudeMs2;
+    vectorSamples[validCount] = w.handVectorMs2;
+    selectedSamples[validCount] = w.handAxis[axisIndex()].amplitudeMs2;
+    errorSamples[validCount] = trackingError;
+    toolSyncSamples[validCount] = w.toolAxis[tracker.referenceAxis].syncRatio;
+    toolAmpSamples[validCount] = w.toolAxis[tracker.referenceAxis].amplitudeMs2;
+
+    p.selectedMinMs2 = fmin(p.selectedMinMs2, selectedSamples[validCount]);
+    p.selectedMaxMs2 = fmax(p.selectedMaxMs2, selectedSamples[validCount]);
+    p.trackingErrorMaxAbsDeg = fmax(p.trackingErrorMaxAbsDeg, fabs(trackingError));
+
+    if (verboseSamples) {
+      Serial.print("TRACK_SAMPLE,");
+      Serial.print(p.targetRelativePhaseDeg, 2); Serial.print(",");
+      Serial.print(trackingError, 3); Serial.print(",");
+      Serial.print(w.toolAxis[tracker.referenceAxis].phaseDeg, 3); Serial.print(",");
+      Serial.print(w.commandOffsetMidDeg, 3); Serial.print(",");
+      Serial.print(tracker.filteredFrequencyErrorHz, 5); Serial.print(",");
+      Serial.print(w.toolAxis[tracker.referenceAxis].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.toolAxis[tracker.referenceAxis].syncRatio, 4); Serial.print(",");
+      Serial.print(w.handAxis[axisIndex()].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+      Serial.println(w.handVectorMs2, 6);
+    }
+    validCount++;
+  }
+
+  p.validSamples = validCount;
+  if (validCount < requiredValidWindows) return p;
+
+  for (uint8_t a = 0; a < 3; a++) {
+    p.axisMeanMs2[a] = meanSmall(axisSamples[a], validCount);
+    double sd = sampleSdSmall(axisSamples[a], validCount, p.axisMeanMs2[a]);
+    p.axisCvPercent[a] = p.axisMeanMs2[a] > 1.0e-12 ? 100.0 * sd / p.axisMeanMs2[a] : 999.0;
+  }
+  p.selectedMeanMs2 = meanSmall(selectedSamples, validCount);
+  p.selectedSdMs2 = sampleSdSmall(selectedSamples, validCount, p.selectedMeanMs2);
+  p.selectedCvPercent = p.selectedMeanMs2 > 1.0e-12
+      ? 100.0 * p.selectedSdMs2 / p.selectedMeanMs2 : 999.0;
+  p.vectorMeanMs2 = meanSmall(vectorSamples, validCount);
+  double vectorSd = sampleSdSmall(vectorSamples, validCount, p.vectorMeanMs2);
+  p.vectorCvPercent = p.vectorMeanMs2 > 1.0e-12 ? 100.0 * vectorSd / p.vectorMeanMs2 : 999.0;
+
+  p.trackingErrorMeanDeg = meanSmall(errorSamples, validCount);
+  p.trackingErrorSdDeg = sampleSdSmall(errorSamples, validCount, p.trackingErrorMeanDeg);
+  p.meanToolSync = meanSmall(toolSyncSamples, validCount);
+  p.meanToolAmplitudeMs2 = meanSmall(toolAmpSamples, validCount);
+
+  double selectedBase = baselineHandAtF0.axis[axisIndex()].amplitudeMs2;
+  if (selectedBase > 1.0e-12)
+    p.selectedReductionPercent = 100.0 * (selectedBase - p.selectedMeanMs2) / selectedBase;
+  double vectorBase = baselineHandAtF0.vectorAmplitudeMs2;
+  if (vectorBase > 1.0e-12)
+    p.vectorChangePercent = 100.0 * (p.vectorMeanMs2 - vectorBase) / vectorBase;
+  for (uint8_t a = 0; a < 3; a++) {
+    double base = baselineHandAtF0.axis[a].amplitudeMs2;
+    if (base > 1.0e-12) p.axisChangePercent[a] = 100.0 * (p.axisMeanMs2[a] - base) / base;
+  }
+
+  p.valid = true;
+  return p;
+}
+
+void printTrackedPhasePoint(const TrackedPhasePoint &p, const char *label) {
+  Serial.println();
+  Serial.print(label); Serial.print(" | beta "); Serial.print(p.targetRelativePhaseDeg, 1); Serial.println(" deg");
+  if (!p.valid) {
+    Serial.print("  INVALID | valid accepted windows "); Serial.println(p.validSamples);
+    return;
+  }
+  Serial.print("  ADXL1 reference: "); Serial.print(axisCharFromIndex(p.referenceAxis));
+  Serial.print(" | tool amp "); Serial.print(p.meanToolAmplitudeMs2, 6);
+  Serial.print(" | mean sync "); Serial.println(p.meanToolSync, 3);
+  Serial.print("  tracking error mean/SD/maxabs: ");
+  Serial.print(p.trackingErrorMeanDeg, 2); Serial.print(" / ");
+  Serial.print(p.trackingErrorSdDeg, 2); Serial.print(" / ");
+  Serial.print(p.trackingErrorMaxAbsDeg, 2); Serial.println(" deg");
+  Serial.print("  selected "); Serial.print(axisChar()); Serial.print(" mean ");
+  Serial.print(p.selectedMeanMs2, 6); Serial.print(" | CV ");
+  Serial.print(p.selectedCvPercent, 2); Serial.print(" % | reduction ");
+  Serial.print(p.selectedReductionPercent, 2); Serial.println(" %");
+  Serial.print("  X/Y/Z means: ");
+  Serial.print(p.axisMeanMs2[0], 6); Serial.print(" / ");
+  Serial.print(p.axisMeanMs2[1], 6); Serial.print(" / ");
+  Serial.println(p.axisMeanMs2[2], 6);
+  Serial.print("  vector mean "); Serial.print(p.vectorMeanMs2, 6);
+  Serial.print(" | vector change "); Serial.print(p.vectorChangePercent, 2); Serial.println(" %");
+
+  Serial.print("CSV_TRACK_POINT,"); Serial.print(label); Serial.print(",");
+  Serial.print(p.targetRelativePhaseDeg, 2); Serial.print(",");
+  Serial.print(axisCharFromIndex(p.referenceAxis)); Serial.print(",");
+  Serial.print(p.validSamples); Serial.print(",");
+  Serial.print(p.trackingErrorMeanDeg, 3); Serial.print(",");
+  Serial.print(p.trackingErrorSdDeg, 3); Serial.print(",");
+  Serial.print(p.trackingErrorMaxAbsDeg, 3); Serial.print(",");
+  Serial.print(p.meanToolAmplitudeMs2, 6); Serial.print(",");
+  Serial.print(p.meanToolSync, 4); Serial.print(",");
+  Serial.print(p.selectedMeanMs2, 6); Serial.print(",");
+  Serial.print(p.selectedCvPercent, 3); Serial.print(",");
+  Serial.print(p.selectedReductionPercent, 3); Serial.print(",");
+  Serial.print(p.axisMeanMs2[0], 6); Serial.print(",");
+  Serial.print(p.axisMeanMs2[1], 6); Serial.print(",");
+  Serial.print(p.axisMeanMs2[2], 6); Serial.print(",");
+  Serial.print(p.vectorMeanMs2, 6); Serial.print(",");
+  Serial.println(p.vectorChangePercent, 3);
+}
+
+void runIntegratedPhaseSweep() {
+  if (!baselineValid || !baselineAxisSelected ||
+      (integratedWorkflowState != IntegratedWorkflowState::AWAIT_PHASE_TOOL_ON &&
+       integratedWorkflowState != IntegratedWorkflowState::AWAIT_SECONDARY_ID)) {
+    Serial.println("Not ready. Legacy w requires: a -> x/y/z -> TOOL OFF -> c -> TOOL ON -> w (d optional)");
+    return;
+  }
+  if (!visatonRunning ||
+      fabs(currentDacAmplitude - frozenMatchDac) > 1.0e-9 ||
+      fabs(currentCommandFrequencyHz - testFrequencyHz) > 1.0e-6) {
+    Serial.println("TRACKED PHASE SWEEP ABORT: frozen Stage-B actuator command is no longer running.");
+    Serial.println("Repeat c with TOOL OFF, then turn TOOL ON and press w.");
+    return;
+  }
+  if (!phaseReferenceLeakageValid) {
+    Serial.println("TRACKED PHASE SWEEP ABORT: Stage-B ADXL1 actuator-leakage check was not valid.");
+    Serial.println("Switch TOOL OFF and repeat c so the reference-independence check can be completed.");
+    return;
+  }
+  if (!phaseReferenceAxisValid && !choosePhaseReferenceAxis(true)) {
+    Serial.println("TRACKED PHASE SWEEP ABORT: no trustworthy ADXL1 phase-reference axis.");
+    Serial.println("Check ADXL1 mounting and actuator leakage into the tool reference.");
+    return;
+  }
+
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  integratedWorkflowState = IntegratedWorkflowState::PHASE_SWEEP_RUNNING;
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("STAGE C V2.0 - TOOL-REFERENCED PHASE-TRACKED COARSE + FINE SWEEP");
+  Serial.println("ADXL1 supplies the live tool phase. ADXL2 remains the vibration-error sensor.");
+  Serial.print("Frozen Stage-B NCO frequency: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+  Serial.print("Frozen Stage-B DAC: "); Serial.println(frozenMatchDac, 2);
+  Serial.print("Objective axis: ADXL2 "); Serial.println(axisChar());
+  Serial.print("Live phase reference: ADXL1 "); Serial.println(axisCharFromIndex(phaseReferenceAxis));
+  Serial.println("DAC is NOT adapted in Stage C. The NCO base frequency is NOT reacquired.");
+  Serial.println("Only the NCO phase offset is updated so command-tool relative phase beta is maintained.");
+  Serial.println("Unknown amplifier/actuator/mount phase is absorbed into the experimentally found beta optimum.");
+  Serial.println("================================================================================");
+  Serial.println("CSV_TRACK_SAMPLE_HEADER,BetaTarget_deg,TrackError_deg,ToolPhase_deg,CmdOffsetMid_deg,DeltaF_Hz,ToolAmp,ToolSync,SelectedAmp,X,Y,Z,Vector");
+  Serial.println("CSV_TRACK_POINT_HEADER,Label,BetaTarget_deg,RefAxis,Valid,TrackErrMean,TrackErrSD,TrackErrMaxAbs,ToolAmp,ToolSync,SelectedMean,SelectedCV,SelectedReduction,Xmean,Ymean,Zmean,VectorMean,VectorChange");
+
+  if (!interruptibleDelay(TRACK_TOOL_STEADY_DELAY_MS)) goto phase_cleanup;
+
+  {
+    PhaseTrackerState tracker = {};
+    double initialBeta = 0.0;
+    if (!initializeToolPhaseTracker(tracker, initialBeta)) {
+      Serial.println("TRACKED PHASE SWEEP ABORT: live ADXL1 reference preflight failed.");
+      goto phase_cleanup;
+    }
+
+    Serial.print("Tracker preflight PASS | initial command-tool beta ");
+    Serial.print(initialBeta, 2); Serial.print(" deg | estimated tool-NCO slip ");
+    Serial.print(tracker.filteredFrequencyErrorHz, 5); Serial.println(" Hz");
+
+    TrackedPhasePoint bestSelected = {};
+    bestSelected.selectedMeanMs2 = 1.0e99;
+    TrackedPhasePoint bestVector = {};
+    bestVector.vectorMeanMs2 = 1.0e99;
+    uint8_t coarseValid = 0;
+
+    for (uint8_t i = 0; i < TRACK_COARSE_POINT_COUNT; i++) {
+      double beta = i * TRACK_COARSE_STEP_DEG;
+      TrackedPhasePoint p = measureTrackedPhasePoint(
+          tracker, beta, TRACK_COARSE_VALID_WINDOWS, true);
+      printTrackedPhasePoint(p, "COARSE");
+      if (p.valid) {
+        coarseValid++;
+        if (p.selectedMeanMs2 < bestSelected.selectedMeanMs2) bestSelected = p;
+        if (p.vectorMeanMs2 < bestVector.vectorMeanMs2) bestVector = p;
+      }
+      if (checkEmergencyStop() || !visatonRunning) goto phase_cleanup;
+    }
+
+    if (coarseValid < 8 || !bestSelected.valid) {
+      Serial.println("TRACKED PHASE SWEEP FAILED: insufficient valid coarse phase points.");
+      goto phase_cleanup;
+    }
+
+    Serial.println();
+    Serial.print("Best coarse selected-axis beta: "); Serial.print(bestSelected.targetRelativePhaseDeg, 1);
+    Serial.print(" deg | selected mean "); Serial.println(bestSelected.selectedMeanMs2, 6);
+
+    // Fine sweep: best coarse +/-30 deg in 10-deg increments.
+    TrackedPhasePoint bestFine = bestSelected;
+    for (int k = -3; k <= 3; k++) {
+      double beta = phaseWrap360(bestSelected.targetRelativePhaseDeg + k * TRACK_FINE_STEP_DEG);
+      TrackedPhasePoint p = measureTrackedPhasePoint(
+          tracker, beta, TRACK_FINE_VALID_WINDOWS, true);
+      printTrackedPhasePoint(p, "FINE");
+      if (p.valid) {
+        if (p.selectedMeanMs2 < bestFine.selectedMeanMs2) bestFine = p;
+        if (p.vectorMeanMs2 < bestVector.vectorMeanMs2) bestVector = p;
+      }
+      if (checkEmergencyStop() || !visatonRunning) goto phase_cleanup;
+    }
+
+    Serial.println();
+    Serial.println("FINAL TRACKED VERIFICATION HOLD");
+    TrackedPhasePoint finalHold = measureTrackedPhasePoint(
+        tracker, bestFine.targetRelativePhaseDeg, TRACK_FINAL_VALID_WINDOWS, true);
+    printTrackedPhasePoint(finalHold, "FINAL");
+    if (!finalHold.valid) {
+      Serial.println("FINAL TRACKED HOLD FAILED - do not claim sustained cancellation from this run.");
+      goto phase_cleanup;
+    }
+
+    lastBestPhaseDeg = finalHold.targetRelativePhaseDeg;
+    lastBestPhaseResidualMs2 = finalHold.selectedMeanMs2;
+    lastPhaseSweepValid = true;
+
+    Serial.println();
+    Serial.println("===================== V2.0 PHASE TEST FINAL SUMMARY =====================");
+    Serial.print("Tool reference: ADXL1 "); Serial.println(axisCharFromIndex(phaseReferenceAxis));
+    Serial.print("Best tracked command-tool beta: "); Serial.print(finalHold.targetRelativePhaseDeg, 2); Serial.println(" deg");
+    Serial.print("Tracking error mean/SD/maxabs: ");
+    Serial.print(finalHold.trackingErrorMeanDeg, 2); Serial.print(" / ");
+    Serial.print(finalHold.trackingErrorSdDeg, 2); Serial.print(" / ");
+    Serial.print(finalHold.trackingErrorMaxAbsDeg, 2); Serial.println(" deg");
+    Serial.print("Selected-axis baseline -> tracked: ");
+    Serial.print(baselineHandAtF0.axis[axisIndex()].amplitudeMs2, 6); Serial.print(" -> ");
+    Serial.print(finalHold.selectedMeanMs2, 6); Serial.print(" m/s^2 | reduction ");
+    Serial.print(finalHold.selectedReductionPercent, 2); Serial.println(" %");
+    Serial.print("Vector baseline -> tracked: ");
+    Serial.print(baselineHandAtF0.vectorAmplitudeMs2, 6); Serial.print(" -> ");
+    Serial.print(finalHold.vectorMeanMs2, 6); Serial.print(" m/s^2 | change ");
+    Serial.print(finalHold.vectorChangePercent, 2); Serial.println(" %");
+    Serial.print("Tracked X/Y/Z means: ");
+    Serial.print(finalHold.axisMeanMs2[0], 6); Serial.print(" / ");
+    Serial.print(finalHold.axisMeanMs2[1], 6); Serial.print(" / ");
+    Serial.println(finalHold.axisMeanMs2[2], 6);
+
+    if (finalHold.selectedReductionPercent > 0.0) {
+      Serial.println("SELECTED-AXIS PHASE-DEPENDENT ATTENUATION OBSERVED UNDER LIVE TOOL-REFERENCED TRACKING.");
+      if (finalHold.vectorChangePercent < 0.0)
+        Serial.println("TOTAL VECTOR ALSO IMPROVED IN THIS RUN.");
+      else
+        Serial.println("TOTAL VECTOR DID NOT IMPROVE: classify as selected-axis attenuation / cross-axis redistribution.");
+    } else {
+      Serial.println("NO SELECTED-AXIS ATTENUATION IN THE FINAL TRACKED HOLD.");
+    }
+    Serial.println("Repeat independent runs before treating any percentage as a thesis-level performance value.");
+    Serial.println("For safety and scientific clarity, V2.0 stops the Visaton after the final tracked verification.");
+    Serial.println("=========================================================================");
+    Serial.print("CSV_TRACK_BEST,");
+    Serial.print(testFrequencyHz, 6); Serial.print(",");
+    Serial.print(frozenMatchDac, 2); Serial.print(",");
+    Serial.print(axisChar()); Serial.print(",");
+    Serial.print(axisCharFromIndex(phaseReferenceAxis)); Serial.print(",");
+    Serial.print(finalHold.targetRelativePhaseDeg, 2); Serial.print(",");
+    Serial.print(finalHold.trackingErrorMeanDeg, 3); Serial.print(",");
+    Serial.print(finalHold.trackingErrorSdDeg, 3); Serial.print(",");
+    Serial.print(finalHold.selectedMeanMs2, 6); Serial.print(",");
+    Serial.print(finalHold.selectedCvPercent, 3); Serial.print(",");
+    Serial.print(finalHold.selectedReductionPercent, 3); Serial.print(",");
+    Serial.print(finalHold.vectorMeanMs2, 6); Serial.print(",");
+    Serial.println(finalHold.vectorChangePercent, 3);
+  }
+
+phase_cleanup:
+  stopVisaton();
+  automaticTestRunning = false;
+  if (emergencyStopRequested) {
+    baselineValid = false;
+    baselineAxisSelected = false;
+    integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+  } else {
+    integratedWorkflowState = IntegratedWorkflowState::AWAIT_TOOL_OFF;
+    Serial.println("Stage C ended with Visaton OFF. For another complete run, switch TOOL OFF and repeat c, or restart with a if the setup changed.");
+  }
+}
+
+
+// ============================================================================
+// SINGLE-FREQUENCY COMPLEX NORMALIZED FXLMS (V1.0)
+// ============================================================================
+
+FxComplex fxMake(double re, double im) { FxComplex z = {re, im}; return z; }
+FxComplex fxAdd(FxComplex a, FxComplex b) { return fxMake(a.re + b.re, a.im + b.im); }
+FxComplex fxMul(FxComplex a, FxComplex b) {
+  return fxMake(a.re * b.re - a.im * b.im,
+                a.re * b.im + a.im * b.re);
+}
+FxComplex fxConj(FxComplex a) { return fxMake(a.re, -a.im); }
+FxComplex fxScale(FxComplex a, double k) { return fxMake(a.re * k, a.im * k); }
+double fxAbs2(FxComplex a) { return a.re * a.re + a.im * a.im; }
+double fxAbs(FxComplex a) { return sqrt(fxAbs2(a)); }
+double fxPhaseDeg(FxComplex a) { return wrapDegrees(atan2(a.im, a.re) * 180.0 / PI); }
+FxComplex fxPolar(double magnitude, double phaseDeg) {
+  double r = phaseDeg * PI / 180.0;
+  return fxMake(magnitude * cos(r), magnitude * sin(r));
+}
+
+bool fxWindowSafetyOk(const PairedTrackingWindow &w) {
+  if (!w.valid) return false;
+  for (uint8_t a = 0; a < 3; a++) {
+    if (w.handAxis[a].amplitudeMs2 > PHASE_AXIS_ABORT_MS2) return false;
+  }
+  if (w.handVectorMs2 > PHASE_VECTOR_ABORT_MS2) return false;
+  return true;
+}
+
+FxSecondaryPathProbe fxMeasureSecondaryPathProbe(double commandPhaseDeg, double probeDac) {
+  FxSecondaryPathProbe out = {};
+  out.commandPhaseDeg = phaseWrap360(commandPhaseDeg);
+  if (!visatonRunning || probeDac <= 0.0) return out;
+
+  if (!setVisatonAmplitudeContinuous(probeDac)) return out;
+  setVisatonPhaseOffsetTargetDeg(out.commandPhaseDeg);
+  if (!waitForPhaseOffsetSettled(250, 1.0)) return out;
+  if (!interruptibleDelay(FX_SEC_SETTLE_MS)) return out;
+
+  // Collect five raw windows. We intentionally keep the per-window gate loose
+  // enough to observe the plant, then apply one robust outlier pass before the
+  // strict final CV / phase-SD acceptance gates.
+  double rawGains[FX_SEC_WINDOWS_PER_PROBE];
+  double rawPhases[FX_SEC_WINDOWS_PER_PROBE];
+  double rawResponses[FX_SEC_WINDOWS_PER_PROBE];
+  double rawSyncs[FX_SEC_WINDOWS_PER_PROBE];
+  uint8_t rawValid = 0;
+
+  for (uint8_t k = 0; k < FX_SEC_WINDOWS_PER_PROBE; k++) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (checkEmergencyStop()) return out;
+    if (!fxWindowSafetyOk(w)) continue;
+
+    const AxisSyncResult &h = w.handAxis[axisIndex()];
+    if (h.amplitudeMs2 < FX_SEC_MIN_RESPONSE_MS2 || h.syncRatio < FX_SEC_MIN_SYNC) continue;
+
+    rawGains[rawValid] = h.amplitudeMs2 / probeDac;
+    // Hand response and electrical command are both referenced to the SAME NCO.
+    rawPhases[rawValid] = wrapDegrees(h.phaseDeg - w.commandOffsetMidDeg);
+    rawResponses[rawValid] = h.amplitudeMs2;
+    rawSyncs[rawValid] = h.syncRatio;
+    rawValid++;
+
+    if (k + 1 < FX_SEC_WINDOWS_PER_PROBE && !interruptibleDelay(25)) return out;
+  }
+
+  if (rawValid < FX_SEC_MIN_VALID_WINDOWS) return out;
+
+  // Robust center estimates. At most one clearly inconsistent transient is
+  // expected to be removable because 4/5 final inliers are required.
+  double gainMedian = medianSmall(rawGains, rawValid);
+  double phaseCenter = circularMeanDeg(rawPhases, rawValid);
+
+  double gains[FX_SEC_WINDOWS_PER_PROBE];
+  double phases[FX_SEC_WINDOWS_PER_PROBE];
+  double responses[FX_SEC_WINDOWS_PER_PROBE];
+  double syncs[FX_SEC_WINDOWS_PER_PROBE];
+  uint8_t inliers = 0;
+
+  for (uint8_t k = 0; k < rawValid; k++) {
+    double gainDevPct = gainMedian > 1.0e-12
+      ? 100.0 * fabs(rawGains[k] - gainMedian) / gainMedian : 999.0;
+    double phaseDevDeg = fabs(wrapDegrees(rawPhases[k] - phaseCenter));
+    if (gainDevPct > FX_SEC_OUTLIER_GAIN_DEV_PERCENT ||
+        phaseDevDeg > FX_SEC_OUTLIER_PHASE_DEV_DEG) continue;
+
+    gains[inliers] = rawGains[k];
+    phases[inliers] = rawPhases[k];
+    responses[inliers] = rawResponses[k];
+    syncs[inliers] = rawSyncs[k];
+    inliers++;
+  }
+
+  out.validWindows = inliers;
+  if (inliers < FX_SEC_MIN_VALID_WINDOWS) return out;
+
+  out.gainMs2PerDac = meanSmall(gains, inliers);
+  double gainSd = sampleSdSmall(gains, inliers, out.gainMs2PerDac);
+  out.gainCvPercent = out.gainMs2PerDac > 1.0e-12
+      ? 100.0 * gainSd / out.gainMs2PerDac : 999.0;
+  out.phaseDeg = circularMeanDeg(phases, inliers);
+  out.phaseSdDeg = circularSdDeg(phases, inliers, out.phaseDeg);
+  out.meanResponseMs2 = meanSmall(responses, inliers);
+  out.meanSync = meanSmall(syncs, inliers);
+
+  // Keep the original strict 10% gain-CV and 15-deg phase-SD gates. V1.2
+  // improves SNR / statistics instead of simply loosening acceptance criteria.
+  out.valid = out.gainMs2PerDac > 1.0e-9 &&
+              out.meanSync >= FX_SEC_MIN_MEAN_SYNC &&
+              out.gainCvPercent <= FX_SEC_MAX_GAIN_CV_PERCENT &&
+              out.phaseSdDeg <= FX_SEC_MAX_PHASE_SD_DEG;
+  return out;
+}
+
+void printFxSecondaryProbe(uint8_t index, const FxSecondaryPathProbe &p) {
+  Serial.print("FX_SEC_PROBE #"); Serial.print(index + 1);
+  Serial.print(" | cmd phase "); Serial.print(p.commandPhaseDeg, 1);
+  Serial.print(" deg | response "); Serial.print(p.meanResponseMs2, 6);
+  Serial.print(" | gain "); Serial.print(p.gainMs2PerDac, 7);
+  Serial.print(" m/s2/DAC | S phase "); Serial.print(p.phaseDeg, 2);
+  Serial.print(" deg | gain CV "); Serial.print(p.gainCvPercent, 2);
+  Serial.print(" % | phase SD "); Serial.print(p.phaseSdDeg, 2);
+  Serial.print(" deg | sync "); Serial.print(p.meanSync, 3);
+  Serial.print(" | valid windows "); Serial.print(p.validWindows);
+  Serial.print(" | "); Serial.println(p.valid ? "PASS" : "REJECT");
+
+  Serial.print("CSV_FX_SEC_PROBE,"); Serial.print(index + 1); Serial.print(",");
+  Serial.print(p.commandPhaseDeg, 3); Serial.print(",");
+  Serial.print(p.meanResponseMs2, 7); Serial.print(",");
+  Serial.print(p.gainMs2PerDac, 8); Serial.print(",");
+  Serial.print(p.phaseDeg, 4); Serial.print(",");
+  Serial.print(p.gainCvPercent, 3); Serial.print(",");
+  Serial.print(p.phaseSdDeg, 3); Serial.print(",");
+  Serial.print(p.meanSync, 4); Serial.print(",");
+  Serial.print(p.validWindows); Serial.print(",");
+  Serial.println(p.valid ? 1 : 0);
+}
+
+
+double fxProbeSurveyScore(const FxSecondaryPathProbe &p, double probeDac,
+                          double targetMs2) {
+  if (!p.valid) return -1.0e9;
+  double ratio = targetMs2 > 1.0e-9 ? p.meanResponseMs2 / targetMs2 : 1.0;
+  double responseScore = fmin(ratio, 1.0);
+  // Excessive over-excitation is not forbidden, but it is gently penalized so
+  // a lower-DAC equally coherent point wins.
+  double overPenalty = ratio > 1.50 ? 0.35 * (ratio - 1.50) : 0.0;
+  return 4.0 * p.meanSync +
+         1.5 * responseScore -
+         0.05 * p.gainCvPercent -
+         0.03 * p.phaseSdDeg -
+         0.015 * probeDac -
+         overPenalty;
+}
+
+void runFxSecondaryPathIdentification() {
+  if (!baselineValid || !baselineAxisSelected ||
+      (integratedWorkflowState != IntegratedWorkflowState::AWAIT_TOOL_OFF &&
+       integratedWorkflowState != IntegratedWorkflowState::AWAIT_SECONDARY_ID)) {
+    Serial.println("Not ready for i. Normal FxLMS order: a -> x/y/z -> TOOL OFF -> i");
+    Serial.println("d and c are optional diagnostics. V1.2 performs its own robust probe survey.");
+    return;
+  }
+
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  fxSecondaryPathValid = false;
+  fxLastRunValid = false;
+  fxLastSystemCandidateValid = false;
+  fxLastRunBaseline = {};
+  phaseReferenceLeakageValid = false;
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("FXLMS STAGE I - SINGLE-FREQUENCY SECONDARY-PATH IDENTIFICATION V1.2");
+  Serial.println("TOOL MUST BE OFF. VISATON ONLY. Do not move the wearable/mount/amplifier knob.");
+  Serial.print("f0: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+  Serial.print("Selected ADXL2 error axis: "); Serial.println(axisChar());
+  Serial.println("V1.2: survey -> rank -> robust 0/90/0 ID -> retry -> fallback candidate.");
+  Serial.println("d and c are OPTIONAL for FxLMS; neither is required by i.");
+  Serial.println("================================================================================");
+  Serial.println("CSV_FX_SEC_PROBE_HEADER,N,CmdPhase_deg,Response_mps2,Gain_mps2_per_DAC,Sphase_deg,GainCV_pct,PhaseSD_deg,Sync,ValidWindows,Pass");
+
+  if (!choosePhaseReferenceAxis(true)) {
+    Serial.println("SECONDARY ID ABORT: no usable Stage-A ADXL1 reference axis.");
+    goto fx_i_cleanup_fail;
+  }
+
+  {
+    struct ProbeCandidate {
+      bool valid;
+      bool preferred;
+      double dac;
+      double score;
+      FxSecondaryPathProbe survey;
+    };
+
+    ProbeCandidate candidates[FX_AUTO_PROBE_COUNT];
+    uint8_t candidateCount = 0;
+
+    double minimumResponse = fmax(FX_AUTO_PROBE_MIN_RESPONSE_MS2,
+                                  FX_AUTO_PROBE_MIN_RESPONSE_FRACTION * targetAmplitudeMs2);
+    double preferredResponse = fmax(FX_AUTO_PROBE_MIN_RESPONSE_MS2,
+                                    FX_AUTO_PROBE_PREFERRED_RESPONSE_FRACTION * targetAmplitudeMs2);
+
+    Serial.println();
+    Serial.println("---------------- ROBUST SECONDARY-PATH PROBE SURVEY ----------------");
+    Serial.print("Minimum usable selected-axis response: "); Serial.print(minimumResponse, 4); Serial.println(" m/s^2");
+    Serial.print("Preferred selected-axis response:      "); Serial.print(preferredResponse, 4); Serial.println(" m/s^2");
+    Serial.println("Each DAC uses five windows; >=4 coherent inliers are required.");
+    Serial.println("Final gain-CV <=10% and phase-SD <=15 deg gates are NOT relaxed.");
+
+    if (quickDacSweepDone && quickAxisReachable[axisIndex()]) {
+      Serial.print("Optional d hint available: rough target DAC = ");
+      Serial.println(quickAxisEstimatedDac[axisIndex()], 2);
+    }
+    if (frozenMatchDac > 0.0) {
+      Serial.print("Optional c hint available: matched DAC = ");
+      Serial.println(frozenMatchDac, 2);
+    }
+
+    Serial.println("CSV_FX_SURVEY_HEADER,DAC,Response_mps2,Gain_mps2_per_DAC,Sphase_deg,GainCV_pct,PhaseSD_deg,Sync,ValidWindows,Usable,Preferred,Score");
+
+    for (uint8_t k = 0; k < FX_AUTO_PROBE_COUNT; k++) {
+      if (checkEmergencyStop()) goto fx_i_cleanup_fail;
+
+      double candidateDac = FX_AUTO_PROBE_LEVELS[k];
+      stopVisaton();
+      if (!startVisatonFxInitial(testFrequencyHz, candidateDac)) {
+        Serial.print("AUTO_SURVEY DAC "); Serial.print(candidateDac, 2);
+        Serial.println(" | could not start command");
+        continue;
+      }
+      setVisatonPhaseOffsetTargetDeg(0.0);
+      if (!waitForPhaseOffsetSettled(200, 1.0)) {
+        Serial.print("AUTO_SURVEY DAC "); Serial.print(candidateDac, 2);
+        Serial.println(" | phase settle failed");
+        continue;
+      }
+
+      FxSecondaryPathProbe trial = fxMeasureSecondaryPathProbe(0.0, candidateDac);
+      bool usable = trial.valid && trial.meanResponseMs2 >= minimumResponse;
+      bool preferred = usable &&
+                       trial.meanResponseMs2 >= preferredResponse &&
+                       trial.meanSync >= FX_SEC_PREFERRED_MEAN_SYNC;
+      double score = usable ? fxProbeSurveyScore(trial, candidateDac, targetAmplitudeMs2) : -1.0e9;
+
+      Serial.print("AUTO_SURVEY DAC "); Serial.print(candidateDac, 2);
+      Serial.print(" | response "); Serial.print(trial.meanResponseMs2, 6);
+      Serial.print(" | sync "); Serial.print(trial.meanSync, 3);
+      Serial.print(" | gainCV "); Serial.print(trial.gainCvPercent, 2);
+      Serial.print(" % | phaseSD "); Serial.print(trial.phaseSdDeg, 2);
+      Serial.print(" deg | inliers "); Serial.print(trial.validWindows);
+      Serial.print(" | score "); Serial.print(score, 3);
+      Serial.print(" | ");
+      if (preferred) Serial.println("PREFERRED");
+      else if (usable) Serial.println("USABLE");
+      else Serial.println("REJECT");
+
+      Serial.print("CSV_FX_SURVEY,"); Serial.print(candidateDac, 2); Serial.print(",");
+      Serial.print(trial.meanResponseMs2, 7); Serial.print(",");
+      Serial.print(trial.gainMs2PerDac, 8); Serial.print(",");
+      Serial.print(trial.phaseDeg, 4); Serial.print(",");
+      Serial.print(trial.gainCvPercent, 3); Serial.print(",");
+      Serial.print(trial.phaseSdDeg, 3); Serial.print(",");
+      Serial.print(trial.meanSync, 4); Serial.print(",");
+      Serial.print(trial.validWindows); Serial.print(",");
+      Serial.print(usable ? 1 : 0); Serial.print(",");
+      Serial.print(preferred ? 1 : 0); Serial.print(",");
+      Serial.println(score, 4);
+
+      if (usable && candidateCount < FX_AUTO_PROBE_COUNT) {
+        candidates[candidateCount].valid = true;
+        candidates[candidateCount].preferred = preferred;
+        candidates[candidateCount].dac = candidateDac;
+        candidates[candidateCount].score = score;
+        candidates[candidateCount].survey = trial;
+        candidateCount++;
+      }
+    }
+
+    stopVisaton();
+
+    if (candidateCount == 0) {
+      Serial.println("SECONDARY ID FAILED: no DAC 5..21 produced a sufficiently coherent selected-axis probe.");
+      Serial.println("Use optional d to inspect actuator authority/mounting, then correct the mechanical setup before forcing FxLMS.");
+      goto fx_i_cleanup_fail;
+    }
+
+    // Preferred candidates always outrank fallback usable candidates. Within a
+    // class, use the quality score. This deliberately avoids choosing either
+    // the first barely passing DAC or the largest DAC automatically.
+    for (uint8_t i = 0; i + 1 < candidateCount; i++) {
+      for (uint8_t j = i + 1; j < candidateCount; j++) {
+        bool swapNeeded = false;
+        if (candidates[j].preferred && !candidates[i].preferred) swapNeeded = true;
+        else if (candidates[j].preferred == candidates[i].preferred &&
+                 candidates[j].score > candidates[i].score) swapNeeded = true;
+        if (swapNeeded) {
+          ProbeCandidate tmp = candidates[i];
+          candidates[i] = candidates[j];
+          candidates[j] = tmp;
+        }
+      }
+    }
+
+    Serial.println();
+    Serial.println("Ranked secondary-path candidates:");
+    for (uint8_t i = 0; i < candidateCount; i++) {
+      Serial.print("  #"); Serial.print(i + 1);
+      Serial.print(" DAC "); Serial.print(candidates[i].dac, 2);
+      Serial.print(" | score "); Serial.print(candidates[i].score, 3);
+      Serial.print(" | sync "); Serial.print(candidates[i].survey.meanSync, 3);
+      Serial.print(" | CV "); Serial.print(candidates[i].survey.gainCvPercent, 2);
+      Serial.print(" % | phaseSD "); Serial.print(candidates[i].survey.phaseSdDeg, 2);
+      Serial.print(" deg | "); Serial.println(candidates[i].preferred ? "PREFERRED" : "USABLE");
+    }
+
+    bool identified = false;
+    double acceptedGain = 0.0;
+    double acceptedPhase = 0.0;
+    double acceptedGainCv = 999.0;
+    double acceptedPhaseSd = 999.0;
+    uint8_t candidatesToTry = candidateCount < FX_AUTO_MAX_CANDIDATES_TO_TRY
+      ? candidateCount : FX_AUTO_MAX_CANDIDATES_TO_TRY;
+
+    for (uint8_t rank = 0; rank < candidatesToTry && !identified; rank++) {
+      fxProbeDac = candidates[rank].dac;
+      Serial.println();
+      Serial.println("------------------------------------------------------------");
+      Serial.print("FORMAL SECONDARY ID candidate #"); Serial.print(rank + 1);
+      Serial.print(" at DAC "); Serial.println(fxProbeDac, 2);
+      Serial.println("------------------------------------------------------------");
+
+      stopVisaton();
+      if (!startVisatonFxInitial(testFrequencyHz, fxProbeDac)) {
+        Serial.println("Candidate start failed -> trying next-ranked DAC.");
+        continue;
+      }
+      setVisatonPhaseOffsetTargetDeg(0.0);
+      if (!waitForPhaseOffsetSettled(220, 1.0)) {
+        Serial.println("Candidate phase settle failed -> trying next-ranked DAC.");
+        continue;
+      }
+
+      // Leakage is amplitude-dependent, so re-check it at the actual candidate
+      // used for identification. This can also re-select the best ADXL1 axis.
+      if (!measurePhaseReferenceLeakageAfterMatch()) {
+        Serial.println("Reference leakage check failed at this DAC -> trying next-ranked DAC.");
+        continue;
+      }
+
+      FxSecondaryPathProbe probes[FX_SEC_PROBE_COUNT];
+      bool phaseSetOk = true;
+
+      for (uint8_t p = 0; p < FX_SEC_PROBE_COUNT; p++) {
+        bool probeOk = false;
+        for (uint8_t attempt = 0; attempt <= FX_SEC_PHASE_RETRIES; attempt++) {
+          if (attempt > 0) {
+            Serial.print("Retrying phase probe #"); Serial.print(p + 1);
+            Serial.print(" at "); Serial.print(FX_SEC_PROBE_PHASES_DEG[p], 1);
+            Serial.println(" deg after one unstable measurement...");
+            if (!interruptibleDelay(180)) goto fx_i_cleanup_fail;
+          }
+
+          probes[p] = fxMeasureSecondaryPathProbe(FX_SEC_PROBE_PHASES_DEG[p], fxProbeDac);
+          printFxSecondaryProbe(p, probes[p]);
+          if (probes[p].valid) {
+            probeOk = true;
+            break;
+          }
+        }
+
+        if (!probeOk) {
+          Serial.print("Phase probe #"); Serial.print(p + 1);
+          Serial.println(" failed twice -> trying next-ranked DAC instead of aborting i.");
+          phaseSetOk = false;
+          break;
+        }
+      }
+
+      if (!phaseSetOk) continue;
+
+      double gains[FX_SEC_PROBE_COUNT];
+      double phases[FX_SEC_PROBE_COUNT];
+      for (uint8_t p = 0; p < FX_SEC_PROBE_COUNT; p++) {
+        gains[p] = probes[p].gainMs2PerDac;
+        phases[p] = probes[p].phaseDeg;
+      }
+
+      double meanGain = meanSmall(gains, FX_SEC_PROBE_COUNT);
+      double gainSd = sampleSdSmall(gains, FX_SEC_PROBE_COUNT, meanGain);
+      double gainCv = meanGain > 1.0e-12 ? 100.0 * gainSd / meanGain : 999.0;
+      double meanPhase = circularMeanDeg(phases, FX_SEC_PROBE_COUNT);
+      double phaseSd = circularSdDeg(phases, FX_SEC_PROBE_COUNT, meanPhase);
+      double repeat0PhaseError = fabs(wrapDegrees(probes[2].phaseDeg - probes[0].phaseDeg));
+      double repeat0GainDiffPct = percentDifference(probes[2].gainMs2PerDac,
+                                                     probes[0].gainMs2PerDac);
+
+      Serial.println();
+      Serial.println("---------------- SECONDARY-PATH CONSISTENCY ----------------");
+      Serial.print("Candidate DAC: "); Serial.println(fxProbeDac, 2);
+      Serial.print("Mean |S|: "); Serial.print(meanGain, 8); Serial.println(" m/s2/DAC");
+      Serial.print("Across-probe gain CV: "); Serial.print(gainCv, 3); Serial.println(" %");
+      Serial.print("Mean phase(S): "); Serial.print(meanPhase, 3); Serial.println(" deg");
+      Serial.print("Across-probe phase SD: "); Serial.print(phaseSd, 3); Serial.println(" deg");
+      Serial.print("0-deg repeat gain difference: "); Serial.print(repeat0GainDiffPct, 2); Serial.println(" %");
+      Serial.print("0-deg repeat phase difference: "); Serial.print(repeat0PhaseError, 2); Serial.println(" deg");
+
+      if (gainCv > FX_SEC_MAX_GAIN_CV_PERCENT ||
+          phaseSd > FX_SEC_MAX_PHASE_SD_DEG) {
+        Serial.println("Candidate rejected: 0/90/0 estimates disagree beyond strict final gates.");
+        Serial.println("Trying the next-ranked coherent DAC automatically.");
+        continue;
+      }
+
+      acceptedGain = meanGain;
+      acceptedPhase = meanPhase;
+      acceptedGainCv = gainCv;
+      acceptedPhaseSd = phaseSd;
+      identified = true;
+    }
+
+    if (!identified) {
+      Serial.println();
+      Serial.println("SECONDARY ID FAILED: the best available probe candidates did not survive robust 0/90/0 validation.");
+      Serial.println("Do not loosen thresholds blindly. Use d / inspect mounting if this repeats across unchanged trials.");
+      goto fx_i_cleanup_fail;
+    }
+
+    fxSecondaryGainMs2PerDac = acceptedGain;
+    fxSecondaryPhaseDeg = acceptedPhase;
+    fxSecondaryPath = fxPolar(acceptedGain, acceptedPhase);
+
+    // Without c, the adaptive controller never exceeds the proven survey range.
+    // Small probes keep the historical 15-DAC first-test ceiling; larger probes
+    // become the ceiling themselves, up to the conservative V1.2 hard cap 21.
+    double autoMax = fmax(FX_AUTO_DEFAULT_COMMAND_MAX_DAC, fxProbeDac);
+    fxCommandMaxDac = clampDouble(autoMax, fxProbeDac, FX_AUTO_HARD_COMMAND_MAX_DAC);
+
+    fxSecondaryPathValid = true;
+
+    Serial.println();
+    Serial.println("SECONDARY PATH READY.");
+    Serial.print("S_hat = "); Serial.print(fxSecondaryGainMs2PerDac, 8);
+    Serial.print(" * exp(j "); Serial.print(fxSecondaryPhaseDeg, 3); Serial.println(" deg)");
+    Serial.print("Selected robust probe DAC: "); Serial.println(fxProbeDac, 2);
+    Serial.print("FxLMS adaptive command ceiling: "); Serial.print(fxCommandMaxDac, 2); Serial.println(" DAC");
+    Serial.print("Selected ADXL1 live reference axis: "); Serial.println(axisCharFromIndex(phaseReferenceAxis));
+    Serial.println("CSV_FX_SECONDARY_FINAL,Gain_mps2_per_DAC,Phase_deg,GainCV_pct,PhaseSD_deg,ProbeDAC,RefAxis,CommandMaxDAC");
+    Serial.print("CSV_FX_SECONDARY_FINAL,"); Serial.print(fxSecondaryGainMs2PerDac, 9); Serial.print(",");
+    Serial.print(fxSecondaryPhaseDeg, 5); Serial.print(",");
+    Serial.print(acceptedGainCv, 4); Serial.print(",");
+    Serial.print(acceptedPhaseSd, 4); Serial.print(",");
+    Serial.print(fxProbeDac, 2); Serial.print(",");
+    Serial.print(axisCharFromIndex(phaseReferenceAxis)); Serial.print(",");
+    Serial.println(fxCommandMaxDac, 2);
+  }
+
+  setVisatonPhaseOffsetTargetDeg(0.0);
+  waitForPhaseOffsetSettled(180, 1.0);
+  stopVisaton();
+  automaticTestRunning = false;
+  integratedWorkflowState = IntegratedWorkflowState::FXLMS_READY;
+  Serial.println("VISATON OFF. Now switch TOOL ON, let it stabilize, then enter l 20.");
+  return;
+
+fx_i_cleanup_fail:
+  setVisatonPhaseOffsetTargetDeg(0.0);
+  waitForPhaseOffsetSettled(180, 1.0);
+  stopVisaton();
+  automaticTestRunning = false;
+  fxSecondaryPathValid = false;
+  if (emergencyStopRequested) integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+  else integratedWorkflowState = IntegratedWorkflowState::AWAIT_TOOL_OFF;
+  Serial.println("i ended without a valid secondary path. Keep TOOL OFF; if repeated, inspect d/mounting rather than forcing l.");
+}
+
+bool fxAcquireFreshToolBaseline(FxBaseline &base) {
+  base = {};
+  if (!phaseReferenceAxisValid) return false;
+
+  // Keep the NCO phase accumulator alive with a TRUE zero-amplitude table.
+  // V1.4R does NOT weaken any baseline quality gate. It simply permits up to
+  // ten acquisition attempts to obtain the same original target of five good
+  // windows (and preserves the original >=4-good-window minimum acceptance).
+  if (!startVisatonFxInitial(testFrequencyHz, 0.0)) return false;
+  setVisatonPhaseOffsetTargetDeg(0.0);
+
+  Serial.println();
+  Serial.println("================ V1.4R ROBUST FRESH TOOL BASELINE ================");
+  Serial.println("TOOL ON. Visaton command is zero amplitude; NCO remains phase alive.");
+  Serial.print("Internal steady delay before baseline: ");
+  Serial.print(FX_BASELINE_STEADY_DELAY_MS);
+  Serial.println(" ms");
+  Serial.print("Good windows requested: "); Serial.print(FX_BASELINE_WINDOWS);
+  Serial.print(" | minimum accepted: "); Serial.print(FX_BASELINE_MIN_VALID);
+  Serial.print(" | maximum attempts: "); Serial.println(FX_BASELINE_MAX_ATTEMPTS);
+  Serial.println("No reference/error threshold has been relaxed.");
+  Serial.println("CSV_FXBASE_V14R_HEADER,Attempt,Accepted,Reason,RefAmp,RefSync,ErrAmp,ErrSync,X,Y,Z,Vector");
+
+  if (!interruptibleDelay(FX_BASELINE_STEADY_DELAY_MS)) return false;
+
+  double axis[3][FX_BASELINE_WINDOWS];
+  double vec[FX_BASELINE_WINDOWS];
+  double ref[FX_BASELINE_WINDOWS];
+  uint8_t valid = 0;
+  uint8_t attempts = 0;
+
+  while (attempts < FX_BASELINE_MAX_ATTEMPTS && valid < FX_BASELINE_WINDOWS) {
+    attempts++;
+    PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (checkEmergencyStop()) return false;
+
+    bool accepted = true;
+    const char *reason = "ACCEPT";
+
+    if (!w.valid) {
+      accepted = false;
+      reason = "WINDOW_INVALID";
+    } else if (!fxWindowSafetyOk(w)) {
+      accepted = false;
+      reason = "SAFETY_REJECT";
+    } else if (!liveReferenceWindowAcceptable(w, phaseReferenceAxis)) {
+      accepted = false;
+      reason = "REFERENCE_REJECT";
+    } else {
+      const AxisSyncResult &e = w.handAxis[axisIndex()];
+      if (e.amplitudeMs2 < MIN_REPORT_AMPLITUDE_MS2) {
+        accepted = false;
+        reason = "ERROR_TOO_SMALL";
+      } else if (e.syncRatio < FX_MIN_ERROR_SYNC) {
+        accepted = false;
+        reason = "ERROR_SYNC_LOW";
+      }
+    }
+
+    Serial.print("CSV_FXBASE_V14R,");
+    Serial.print(attempts); Serial.print(",");
+    Serial.print(accepted ? 1 : 0); Serial.print(",");
+    Serial.print(reason); Serial.print(",");
+    Serial.print(w.toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.toolAxis[phaseReferenceAxis].syncRatio, 4); Serial.print(",");
+    Serial.print(w.handAxis[axisIndex()].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[axisIndex()].syncRatio, 4); Serial.print(",");
+    Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+    Serial.println(w.handVectorMs2, 6);
+
+    if (accepted) {
+      for (uint8_t a = 0; a < 3; a++) axis[a][valid] = w.handAxis[a].amplitudeMs2;
+      vec[valid] = w.handVectorMs2;
+      ref[valid] = w.toolAxis[phaseReferenceAxis].amplitudeMs2;
+      valid++;
+    } else {
+      if (!interruptibleDelay(FX_BASELINE_RETRY_GAP_MS)) return false;
+    }
+  }
+
+  base.validWindows = valid;
+  Serial.print("V1.4R BASELINE SUMMARY | attempts "); Serial.print(attempts);
+  Serial.print(" | accepted "); Serial.print(valid); Serial.print("/");
+  Serial.println(FX_BASELINE_WINDOWS);
+
+  // Preserve the original V1.4 acceptance threshold.
+  if (valid < FX_BASELINE_MIN_VALID) {
+    Serial.println("BASELINE FAILED: insufficient GOOD windows after robust retries.");
+    Serial.println("FxLMS adaptation will NOT start; this remains a real signal-quality failure.");
+    return false;
+  }
+
+  for (uint8_t a = 0; a < 3; a++) base.axisMeanMs2[a] = meanSmall(axis[a], valid);
+  base.vectorMeanMs2 = meanSmall(vec, valid);
+  base.selectedMeanMs2 = base.axisMeanMs2[axisIndex()];
+  base.referenceMeanMs2 = meanSmall(ref, valid);
+  base.valid = base.selectedMeanMs2 >= MIN_REPORT_AMPLITUDE_MS2 &&
+               base.referenceMeanMs2 >= TRACK_MIN_TOOL_AMPLITUDE_MS2;
+  return base.valid;
+}
+
+bool fxReferencePhasors(PhaseTrackerState &tracker,
+                        const PairedTrackingWindow &w,
+                        double baselineReferenceAmp,
+                        FxComplex &rCenter,
+                        FxComplex &rPredicted,
+                        double &predictedPhaseDeg) {
+  if (!liveReferenceWindowAcceptable(w, tracker.referenceAxis)) {
+    tracker.rejectedUpdates++;
+    return false;
+  }
+
+  double toolPhaseDeg = w.toolAxis[tracker.referenceAxis].phaseDeg;
+  if (!tracker.initialized) {
+    tracker.initialized = true;
+    tracker.lastToolPhaseDeg = toolPhaseDeg;
+    tracker.lastCenterUs = w.centerUs;
+    tracker.filteredFrequencyErrorHz = 0.0;
+  } else {
+    double dt = static_cast<double>(static_cast<uint32_t>(w.centerUs - tracker.lastCenterUs)) / 1.0e6;
+    if (dt > 0.02 && dt < 1.0) {
+      double dphi = wrapDegrees(toolPhaseDeg - tracker.lastToolPhaseDeg);
+      double instDf = dphi / (360.0 * dt);
+      if (fabs(instDf) <= TRACK_MAX_ABS_FREQ_ERROR_HZ) {
+        tracker.filteredFrequencyErrorHz =
+            (1.0 - TRACK_FREQ_LPF_ALPHA) * tracker.filteredFrequencyErrorHz +
+            TRACK_FREQ_LPF_ALPHA * instDf;
+      } else {
+        tracker.rejectedUpdates++;
+        return false;
+      }
+    }
+    tracker.lastToolPhaseDeg = toolPhaseDeg;
+    tracker.lastCenterUs = w.centerUs;
+  }
+
+  double ampRatio = w.toolAxis[tracker.referenceAxis].amplitudeMs2 /
+                    fmax(baselineReferenceAmp, 1.0e-9);
+  ampRatio = clampDouble(ampRatio, 0.20, 5.00);
+  rCenter = fxPolar(ampRatio, toolPhaseDeg);
+
+  double ageSec = static_cast<double>(static_cast<uint32_t>(micros() - w.centerUs)) / 1.0e6;
+  predictedPhaseDeg = wrapDegrees(
+      toolPhaseDeg + 360.0 * tracker.filteredFrequencyErrorHz * ageSec);
+  rPredicted = fxPolar(ampRatio, predictedPhaseDeg);
+  tracker.validUpdates++;
+  return true;
+}
+
+bool fxApplyCommandFromW(FxComplex &W, FxComplex rPredicted,
+                         double &commandAmp, double &commandPhaseDeg,
+                         bool &saturated) {
+  FxComplex U = fxMul(W, rPredicted);
+  commandAmp = fxAbs(U);
+  saturated = false;
+
+  if (commandAmp > fxCommandMaxDac && commandAmp > 1.0e-12) {
+    double scale = fxCommandMaxDac / commandAmp;
+    W = fxScale(W, scale); // anti-windup: keep W consistent with realizable command
+    U = fxMul(W, rPredicted);
+    commandAmp = fxAbs(U);
+    saturated = true;
+  }
+
+  commandAmp = quantizeFxCommandAmplitude(commandAmp);
+  commandPhaseDeg = fxPhaseDeg(U);
+  setVisatonPhaseOffsetTargetDeg(phaseWrap360(commandPhaseDeg));
+  return setVisatonFxAmplitudeContinuous(commandAmp);
+}
+
+const char *fxAdaptiveStateName(FxAdaptiveState state) {
+  switch (state) {
+    case FxAdaptiveState::STARTUP: return "STARTUP";
+    case FxAdaptiveState::LEARN: return "LEARN";
+    case FxAdaptiveState::FINE: return "FINE";
+    case FxAdaptiveState::HOLD: return "HOLD";
+    default: return "UNKNOWN";
+  }
+}
+
+void fxResetRollingPerformance(FxRollingPerformance &r) {
+  r = {};
+}
+
+void fxPushRollingPerformance(FxRollingPerformance &r,
+                              double selectedReductionPct,
+                              double vectorReductionPct,
+                              FxComplex appliedW) {
+  r.selectedReductionPct[r.head] = selectedReductionPct;
+  r.vectorReductionPct[r.head] = vectorReductionPct;
+  r.appliedW[r.head] = appliedW;
+  r.head = static_cast<uint8_t>((r.head + 1U) % FX_V13_ROLLING_BLOCKS);
+  if (r.count < FX_V13_ROLLING_BLOCKS) r.count++;
+}
+
+FxRollingSummary fxSummarizeRollingPerformance(const FxRollingPerformance &r) {
+  FxRollingSummary out = {};
+  if (r.count == 0) return out;
+  double sumSel = 0.0;
+  double sumVec = 0.0;
+  for (uint8_t i = 0; i < r.count; i++) {
+    sumSel += r.selectedReductionPct[i];
+    sumVec += r.vectorReductionPct[i];
+    if (r.selectedReductionPct[i] > 0.0) out.positiveSelectedBlocks++;
+    if (r.vectorReductionPct[i] > 0.0) out.positiveVectorBlocks++;
+    if (r.selectedReductionPct[i] >= 100.0 * (1.0 - FX_V13_HOLD_ENTER_RATIO))
+      out.deepSelectedBlocks++;
+  }
+  out.meanSelectedReductionPct = sumSel / r.count;
+  out.meanVectorReductionPct = sumVec / r.count;
+  out.full = r.count >= FX_V13_ROLLING_BLOCKS;
+  return out;
+}
+
+bool fxRollingEligibleForBest(const FxRollingSummary &r) {
+  // V1.4 AXIS CHARACTERIZATION:
+  // qualify W only from sustained improvement of the manually selected axis.
+  // Vector and orthogonal axes remain fully measured/logged, but do not decide
+  // whether an X/Y/Z attenuation controller is eligible.
+  return r.full &&
+         r.meanSelectedReductionPct >= FX_V13_BEST_MIN_SELECTED_REDUCTION_PCT &&
+         r.positiveSelectedBlocks >= FX_V13_BEST_MIN_POSITIVE_SELECTED_BLOCKS;
+}
+
+void fxPrintReject(double tSec, const char *reason,
+                   const PairedTrackingWindow *w,
+                   FxAdaptiveState state,
+                   FxComplex W,
+                   double cmdAmp,
+                   uint16_t rejectCount) {
+  Serial.print("CSV_FX_REJECT,");
+  Serial.print(tSec, 3); Serial.print(",");
+  Serial.print(reason); Serial.print(",");
+  if (w) {
+    Serial.print(w->toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w->toolAxis[phaseReferenceAxis].syncRatio, 4); Serial.print(",");
+    Serial.print(w->handAxis[axisIndex()].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w->handAxis[axisIndex()].syncRatio, 4); Serial.print(",");
+    Serial.print(w->handAxis[0].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w->handAxis[1].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w->handAxis[2].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w->handVectorMs2, 6); Serial.print(",");
+  } else {
+    Serial.print("NA,NA,NA,NA,NA,NA,NA,NA,");
+  }
+  Serial.print(fxAbs(W), 6); Serial.print(",");
+  Serial.print(fxPhaseDeg(W), 3); Serial.print(",");
+  Serial.print(cmdAmp, 2); Serial.print(",");
+  Serial.print(fxAdaptiveStateName(state)); Serial.print(",");
+  Serial.println(rejectCount);
+}
+
+FxValidationResult fxRunFrozenValidation(FxComplex W, const FxBaseline &base,
+                                         PhaseTrackerState &tracker) {
+  FxValidationResult out = {};
+  RunningStats axisStats[3];
+  RunningStats vecStats;
+  for (uint8_t a = 0; a < 3; a++) resetRunningStats(axisStats[a]);
+  resetRunningStats(vecStats);
+
+  uint8_t consecutiveInvalid = 0;
+  uint8_t vectorGrowthCount = 0;
+  uint8_t selectedGrowthCount = 0;
+
+  Serial.println();
+  Serial.println("================ FXLMS FROZEN-W VALIDATION ================");
+  Serial.println("W is frozen. Live ADXL1 reference continues to update U = W*r.");
+  Serial.println("Two warm-up blocks are excluded so validation data are generated by the frozen W, not the previous adaptive command.");
+  Serial.println("CSV_FXVAL_V14_HEADER,t_s,RefAmp,RefPhase,DeltaF_Hz,CmdAmp,CmdPhase,X,Y,Z,Vector,XReduction_pct,YReduction_pct,ZReduction_pct,SelectedReduction_pct,VectorReduction_pct,Saturated");
+  Serial.println("CSV_FXVAL_REJECT_HEADER,t_s,Reason,RefAmp,RefSync,X,Y,Z,Vector");
+
+  // Warm up the frozen controller for two valid-reference blocks. These blocks
+  // are deliberately excluded from validation statistics.
+  uint8_t warm = 0;
+  while (warm < 2) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (checkEmergencyStop()) return out;
+    if (!w.valid || !fxWindowSafetyOk(w)) continue;
+    FxComplex rCenter, rPred;
+    double refPredPhase = 0.0;
+    if (!fxReferencePhasors(tracker, w, base.referenceMeanMs2, rCenter, rPred, refPredPhase)) continue;
+    double cmdAmp = 0.0, cmdPhase = 0.0;
+    bool saturated = false;
+    FxComplex Wtemp = W;
+    if (!fxApplyCommandFromW(Wtemp, rPred, cmdAmp, cmdPhase, saturated)) return out;
+    warm++;
+  }
+
+  uint32_t startMs = millis();
+  while (millis() - startMs < FX_VALIDATION_DURATION_MS) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (checkEmergencyStop()) return out;
+    double tSec = (millis() - startMs) / 1000.0;
+
+    if (!w.valid) {
+      consecutiveInvalid++;
+      Serial.print("CSV_FXVAL_REJECT,"); Serial.print(tSec, 3); Serial.println(",WINDOW_INVALID,NA,NA,NA,NA,NA,NA");
+      if (consecutiveInvalid >= FX_MAX_CONSECUTIVE_INVALID) return out;
+      continue;
+    }
+    if (!fxWindowSafetyOk(w)) {
+      Serial.print("CSV_FXVAL_REJECT,"); Serial.print(tSec, 3); Serial.println(",ABSOLUTE_SAFETY_GUARD,NA,NA,NA,NA,NA,NA");
+      return out;
+    }
+
+    FxComplex rCenter, rPred;
+    double refPredPhase = 0.0;
+    if (!fxReferencePhasors(tracker, w, base.referenceMeanMs2, rCenter, rPred, refPredPhase)) {
+      consecutiveInvalid++;
+      Serial.print("CSV_FXVAL_REJECT,"); Serial.print(tSec, 3); Serial.print(",REFERENCE_REJECT,");
+      Serial.print(w.toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.toolAxis[phaseReferenceAxis].syncRatio, 4); Serial.print(",");
+      Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+      Serial.println(w.handVectorMs2, 6);
+      if (consecutiveInvalid >= FX_V13_MAX_REFERENCE_REJECT_BLOCKS) return out;
+      continue;
+    }
+    consecutiveInvalid = 0;
+
+    double cmdAmp = 0.0, cmdPhase = 0.0;
+    bool saturated = false;
+    FxComplex Wtemp = W;
+    if (!fxApplyCommandFromW(Wtemp, rPred, cmdAmp, cmdPhase, saturated)) return out;
+
+    const AxisSyncResult &errAxis = w.handAxis[axisIndex()];
+    if (errAxis.amplitudeMs2 > FX_SELECTED_GROWTH_ABORT_FACTOR * base.selectedMeanMs2) selectedGrowthCount++;
+    else selectedGrowthCount = 0;
+    if (w.handVectorMs2 > FX_VECTOR_COUPLING_ABORT_FACTOR * base.vectorMeanMs2) vectorGrowthCount++;
+    else vectorGrowthCount = 0;
+    if (selectedGrowthCount >= FX_GROWTH_ABORT_BLOCKS || vectorGrowthCount >= FX_GROWTH_ABORT_BLOCKS) {
+      if (selectedGrowthCount >= FX_GROWTH_ABORT_BLOCKS) {
+        Serial.println("FXLMS FROZEN VALIDATION ABORT: selected-axis vibration stayed >150% of baseline for three blocks.");
+      } else {
+        Serial.println("FXLMS FROZEN VALIDATION ABORT: CROSS_AXIS_COUPLING_LIMIT - vector stayed >200% of baseline for three blocks.");
+      }
+      return out;
+    }
+
+    for (uint8_t a = 0; a < 3; a++) pushRunningStats(axisStats[a], w.handAxis[a].amplitudeMs2);
+    pushRunningStats(vecStats, w.handVectorMs2);
+
+    double axisReductionPct[3];
+    for (uint8_t a = 0; a < 3; a++) {
+      axisReductionPct[a] = 100.0 * (1.0 - w.handAxis[a].amplitudeMs2 /
+                                    fmax(base.axisMeanMs2[a], 1.0e-9));
+    }
+    double selectedReduction = axisReductionPct[axisIndex()];
+    double vectorReduction = 100.0 * (1.0 - w.handVectorMs2 /
+                                      fmax(base.vectorMeanMs2, 1.0e-9));
+
+    Serial.print("CSV_FXVAL_V14,"); Serial.print(tSec, 3); Serial.print(",");
+    Serial.print(w.toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(refPredPhase, 3); Serial.print(",");
+    Serial.print(tracker.filteredFrequencyErrorHz, 6); Serial.print(",");
+    Serial.print(cmdAmp, 2); Serial.print(",");
+    Serial.print(cmdPhase, 3); Serial.print(",");
+    Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handVectorMs2, 6); Serial.print(",");
+    Serial.print(axisReductionPct[0], 3); Serial.print(",");
+    Serial.print(axisReductionPct[1], 3); Serial.print(",");
+    Serial.print(axisReductionPct[2], 3); Serial.print(",");
+    Serial.print(selectedReduction, 3); Serial.print(",");
+    Serial.print(vectorReduction, 3); Serial.print(",");
+    Serial.println(saturated ? 1 : 0);
+  }
+
+  out.validWindows = vecStats.n;
+  if (vecStats.n < 5) return out;
+  for (uint8_t a = 0; a < 3; a++) {
+    out.axisMeanMs2[a] = axisStats[a].mean;
+    out.axisCvPercent[a] = axisStats[a].mean > 1.0e-12
+        ? 100.0 * runningSd(axisStats[a]) / axisStats[a].mean : 999.0;
+  }
+  out.vectorMeanMs2 = vecStats.mean;
+  out.vectorCvPercent = vecStats.mean > 1.0e-12
+      ? 100.0 * runningSd(vecStats) / vecStats.mean : 999.0;
+  out.selectedMeanMs2 = out.axisMeanMs2[axisIndex()];
+  out.selectedCvPercent = out.axisCvPercent[axisIndex()];
+  out.selectedReductionPercent = 100.0 * (1.0 - out.selectedMeanMs2 /
+                                           fmax(base.selectedMeanMs2, 1.0e-9));
+  out.vectorReductionPercent = 100.0 * (1.0 - out.vectorMeanMs2 /
+                                         fmax(base.vectorMeanMs2, 1.0e-9));
+  out.valid = true;
+  return out;
+}
+
+
+// ============================================================================
+// V1.4R AUTOMATIC 60-S FROZEN-W PERSISTENCE VALIDATION
+// ============================================================================
+// This function is called automatically from runFxLms() immediately after a
+// SUCCESSFUL independent 10-s frozen validation. It uses the SAME Wbest, SAME
+// fresh baseline, SAME f0, SAME secondary path, SAME live reference tracker,
+// and the same uninterrupted physical setup. There is NO adaptive update here.
+// Vector response is logged as diagnostic telemetry only; it never selects W.
+FxValidationResult fxRunExtendedFrozenValidation60(FxComplex W,
+                                                    const FxBaseline &base,
+                                                    PhaseTrackerState &tracker) {
+  FxValidationResult out = {};
+
+  RunningStats axisStats[3];
+  RunningStats vecStats;
+  for (uint8_t a = 0; a < 3; a++) resetRunningStats(axisStats[a]);
+  resetRunningStats(vecStats);
+
+  // Static segment statistics avoid unnecessary loop-task stack usage.
+  static RunningStats segmentAxis[FX_EXTENDED_FREEZE_SEGMENTS][3];
+  static RunningStats segmentVector[FX_EXTENDED_FREEZE_SEGMENTS];
+  for (uint8_t s = 0; s < FX_EXTENDED_FREEZE_SEGMENTS; s++) {
+    for (uint8_t a = 0; a < 3; a++) resetRunningStats(segmentAxis[s][a]);
+    resetRunningStats(segmentVector[s]);
+  }
+
+  uint8_t consecutiveInvalid = 0;
+  uint8_t selectedGrowthCount = 0;
+  uint8_t vectorGrowthCount = 0;
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("V1.4R AUTOMATIC 60-S FROZEN-W PERSISTENCE VALIDATION");
+  Serial.println("STARTED AUTOMATICALLY: no user command, no remounting, no new secondary path.");
+  Serial.println("NO LEARNING: Wbest remains numerically frozen for the entire 60 s.");
+  Serial.println("ADXL1 remains live, so actuator command continues as U = Wbest * r_live.");
+  Serial.println("Vector is diagnostic telemetry only; it does NOT select or reject Wbest.");
+  Serial.println("Emergency guards: selected axis >150% baseline; vector cross-coupling >200% baseline, each for 3 blocks.");
+  Serial.print("Frozen Wbest = "); Serial.print(W.re, 7); Serial.print(" + j"); Serial.println(W.im, 7);
+  Serial.print("|Wbest| / phase = "); Serial.print(fxAbs(W), 7); Serial.print(" DAC / ");
+  Serial.print(fxPhaseDeg(W), 4); Serial.println(" deg");
+  Serial.println("CSV_FX60_V14R_HEADER,t_s,Segment,RefAmp,RefSync,RefPhase,DeltaF_Hz,CmdAmp,CmdPhase,X,Y,Z,Vector,XReduction_pct,YReduction_pct,ZReduction_pct,SelectedReduction_pct,VectorReduction_pct,Saturated");
+  Serial.println("CSV_FX60_REJECT_HEADER,t_s,Reason,RefAmp,RefSync,X,Y,Z,Vector");
+  Serial.println("================================================================================");
+
+  // IMPORTANT: there is intentionally NO restart and NO warm-up here. The
+  // existing 10-s frozen test has just ended with this same W active. Starting
+  // the 60-s clock immediately preserves continuity of plant, reference, NCO,
+  // tracker and secondary-path conditions.
+  uint32_t startMs = millis();
+
+  while (millis() - startMs < FX_EXTENDED_FREEZE_DURATION_MS) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (checkEmergencyStop()) return out;
+    uint32_t elapsedMs = millis() - startMs;
+    double tSec = elapsedMs / 1000.0;
+
+    if (!w.valid) {
+      consecutiveInvalid++;
+      Serial.print("CSV_FX60_REJECT,"); Serial.print(tSec, 3);
+      Serial.println(",WINDOW_INVALID,NA,NA,NA,NA,NA,NA");
+      if (consecutiveInvalid >= FX_MAX_CONSECUTIVE_INVALID) {
+        Serial.println("FX60 ABORT: repeated invalid sensor/timing windows.");
+        return out;
+      }
+      continue;
+    }
+
+    if (!fxWindowSafetyOk(w)) {
+      Serial.print("CSV_FX60_REJECT,"); Serial.print(tSec, 3);
+      Serial.println(",ABSOLUTE_SAFETY_GUARD,NA,NA,NA,NA,NA,NA");
+      Serial.println("FX60 ABORT: absolute software safety guard exceeded.");
+      return out;
+    }
+
+    FxComplex rCenter, rPred;
+    double refPredPhase = 0.0;
+    if (!fxReferencePhasors(tracker, w, base.referenceMeanMs2,
+                            rCenter, rPred, refPredPhase)) {
+      consecutiveInvalid++;
+      Serial.print("CSV_FX60_REJECT,"); Serial.print(tSec, 3); Serial.print(",REFERENCE_REJECT,");
+      Serial.print(w.toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.toolAxis[phaseReferenceAxis].syncRatio, 4); Serial.print(",");
+      Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+      Serial.println(w.handVectorMs2, 6);
+      if (consecutiveInvalid >= FX_V13_MAX_REFERENCE_REJECT_BLOCKS) {
+        Serial.println("FX60 ABORT: live reference remained invalid.");
+        return out;
+      }
+      continue;
+    }
+    consecutiveInvalid = 0;
+
+    // Frozen controller: W is copied only so the existing command-ceiling helper
+    // may safely bound an applied command if required. The stored W never learns
+    // and never receives an FxLMS gradient update.
+    double cmdAmp = 0.0, cmdPhase = 0.0;
+    bool saturated = false;
+    FxComplex Wtemp = W;
+    if (!fxApplyCommandFromW(Wtemp, rPred, cmdAmp, cmdPhase, saturated)) {
+      Serial.println("FX60 ABORT: failed to maintain frozen actuator command.");
+      return out;
+    }
+
+    const AxisSyncResult &errAxis = w.handAxis[axisIndex()];
+    if (errAxis.amplitudeMs2 > FX_SELECTED_GROWTH_ABORT_FACTOR * base.selectedMeanMs2)
+      selectedGrowthCount++;
+    else
+      selectedGrowthCount = 0;
+
+    if (w.handVectorMs2 > FX_VECTOR_COUPLING_ABORT_FACTOR * base.vectorMeanMs2)
+      vectorGrowthCount++;
+    else
+      vectorGrowthCount = 0;
+
+    if (selectedGrowthCount >= FX_GROWTH_ABORT_BLOCKS) {
+      Serial.println("FX60 ABORT: selected-axis vibration >150% baseline for three consecutive blocks.");
+      return out;
+    }
+    if (vectorGrowthCount >= FX_GROWTH_ABORT_BLOCKS) {
+      Serial.println("FX60 ABORT: CROSS_AXIS_COUPLING_LIMIT - vector >200% baseline for three consecutive blocks.");
+      Serial.println("Selected-axis FxLMS performance is classified separately; Y/Z are telemetry unless total vector doubles.");
+      return out;
+    }
+
+    for (uint8_t a = 0; a < 3; a++) pushRunningStats(axisStats[a], w.handAxis[a].amplitudeMs2);
+    pushRunningStats(vecStats, w.handVectorMs2);
+
+    uint8_t segment = static_cast<uint8_t>(elapsedMs / FX_EXTENDED_FREEZE_SEGMENT_MS);
+    if (segment >= FX_EXTENDED_FREEZE_SEGMENTS) segment = FX_EXTENDED_FREEZE_SEGMENTS - 1;
+    for (uint8_t a = 0; a < 3; a++)
+      pushRunningStats(segmentAxis[segment][a], w.handAxis[a].amplitudeMs2);
+    pushRunningStats(segmentVector[segment], w.handVectorMs2);
+
+    double axisReductionPct[3];
+    for (uint8_t a = 0; a < 3; a++) {
+      axisReductionPct[a] = 100.0 * (1.0 - w.handAxis[a].amplitudeMs2 /
+                                    fmax(base.axisMeanMs2[a], 1.0e-9));
+    }
+    double selectedReduction = axisReductionPct[axisIndex()];
+    double vectorReduction = 100.0 * (1.0 - w.handVectorMs2 /
+                                      fmax(base.vectorMeanMs2, 1.0e-9));
+
+    Serial.print("CSV_FX60_V14R,"); Serial.print(tSec, 3); Serial.print(",");
+    Serial.print(segment + 1); Serial.print(",");
+    Serial.print(w.toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.toolAxis[phaseReferenceAxis].syncRatio, 4); Serial.print(",");
+    Serial.print(refPredPhase, 3); Serial.print(",");
+    Serial.print(tracker.filteredFrequencyErrorHz, 6); Serial.print(",");
+    Serial.print(cmdAmp, 2); Serial.print(",");
+    Serial.print(cmdPhase, 3); Serial.print(",");
+    Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handVectorMs2, 6); Serial.print(",");
+    Serial.print(axisReductionPct[0], 3); Serial.print(",");
+    Serial.print(axisReductionPct[1], 3); Serial.print(",");
+    Serial.print(axisReductionPct[2], 3); Serial.print(",");
+    Serial.print(selectedReduction, 3); Serial.print(",");
+    Serial.print(vectorReduction, 3); Serial.print(",");
+    Serial.println(saturated ? 1 : 0);
+  }
+
+  out.validWindows = vecStats.n;
+  if (vecStats.n < 5) {
+    Serial.println("FX60 FAILED: too few valid windows.");
+    return out;
+  }
+
+  for (uint8_t a = 0; a < 3; a++) {
+    out.axisMeanMs2[a] = axisStats[a].mean;
+    out.axisCvPercent[a] = axisStats[a].mean > 1.0e-12
+        ? 100.0 * runningSd(axisStats[a]) / axisStats[a].mean : 999.0;
+  }
+  out.vectorMeanMs2 = vecStats.mean;
+  out.vectorCvPercent = vecStats.mean > 1.0e-12
+      ? 100.0 * runningSd(vecStats) / vecStats.mean : 999.0;
+  out.selectedMeanMs2 = out.axisMeanMs2[axisIndex()];
+  out.selectedCvPercent = out.axisCvPercent[axisIndex()];
+  out.selectedReductionPercent = 100.0 * (1.0 - out.selectedMeanMs2 /
+                                           fmax(base.selectedMeanMs2, 1.0e-9));
+  out.vectorReductionPercent = 100.0 * (1.0 - out.vectorMeanMs2 /
+                                         fmax(base.vectorMeanMs2, 1.0e-9));
+  out.valid = true;
+
+  Serial.println();
+  Serial.println("CSV_FX60_SEGMENT_HEADER,Segment,Start_s,End_s,ValidWindows,Xmean,Ymean,Zmean,VectorMean,XReduction_pct,YReduction_pct,ZReduction_pct,SelectedReduction_pct,VectorReduction_pct,SelectedCV_pct,VectorCV_pct");
+  for (uint8_t sg = 0; sg < FX_EXTENDED_FREEZE_SEGMENTS; sg++) {
+    if (segmentVector[sg].n == 0) continue;
+
+    double meanAxis[3];
+    double redAxis[3];
+    for (uint8_t a = 0; a < 3; a++) {
+      meanAxis[a] = segmentAxis[sg][a].mean;
+      redAxis[a] = 100.0 * (1.0 - meanAxis[a] / fmax(base.axisMeanMs2[a], 1.0e-9));
+    }
+    double meanVec = segmentVector[sg].mean;
+    double redVec = 100.0 * (1.0 - meanVec / fmax(base.vectorMeanMs2, 1.0e-9));
+    double selectedCv = segmentAxis[sg][axisIndex()].mean > 1.0e-12
+        ? 100.0 * runningSd(segmentAxis[sg][axisIndex()]) /
+          segmentAxis[sg][axisIndex()].mean : 999.0;
+    double vectorCv = meanVec > 1.0e-12
+        ? 100.0 * runningSd(segmentVector[sg]) / meanVec : 999.0;
+
+    Serial.print("CSV_FX60_SEGMENT,"); Serial.print(sg + 1); Serial.print(",");
+    Serial.print(sg * 10); Serial.print(",");
+    Serial.print((sg + 1) * 10); Serial.print(",");
+    Serial.print(segmentVector[sg].n); Serial.print(",");
+    Serial.print(meanAxis[0], 6); Serial.print(",");
+    Serial.print(meanAxis[1], 6); Serial.print(",");
+    Serial.print(meanAxis[2], 6); Serial.print(",");
+    Serial.print(meanVec, 6); Serial.print(",");
+    Serial.print(redAxis[0], 3); Serial.print(",");
+    Serial.print(redAxis[1], 3); Serial.print(",");
+    Serial.print(redAxis[2], 3); Serial.print(",");
+    Serial.print(redAxis[axisIndex()], 3); Serial.print(",");
+    Serial.print(redVec, 3); Serial.print(",");
+    Serial.print(selectedCv, 3); Serial.print(",");
+    Serial.println(vectorCv, 3);
+  }
+
+  Serial.println();
+  Serial.println("================ V1.4R 60-S FROZEN RESULT ================");
+  Serial.print("60-s selected-axis mean: "); Serial.println(out.selectedMeanMs2, 6);
+  Serial.print("60-s selected-axis attenuation: "); Serial.print(out.selectedReductionPercent, 3); Serial.println(" %");
+  Serial.print("60-s selected-axis CV: "); Serial.print(out.selectedCvPercent, 3); Serial.println(" %");
+  Serial.print("60-s vector change (diagnostic): "); Serial.print(out.vectorReductionPercent, 3); Serial.println(" %");
+  Serial.print("Valid 60-s windows: "); Serial.println(out.validWindows);
+  Serial.println("Wbest was not adapted at any point during this 60-s stage.");
+  Serial.println("CSV_FX60_FINAL,SelectedMean,SelectedReduction_pct,SelectedCV_pct,VectorMean,VectorReduction_pct,VectorCV_pct,ValidWindows,WI,WQ,Wmag,Wphase");
+  Serial.print("CSV_FX60_FINAL,");
+  Serial.print(out.selectedMeanMs2, 7); Serial.print(",");
+  Serial.print(out.selectedReductionPercent, 4); Serial.print(",");
+  Serial.print(out.selectedCvPercent, 4); Serial.print(",");
+  Serial.print(out.vectorMeanMs2, 7); Serial.print(",");
+  Serial.print(out.vectorReductionPercent, 4); Serial.print(",");
+  Serial.print(out.vectorCvPercent, 4); Serial.print(",");
+  Serial.print(out.validWindows); Serial.print(",");
+  Serial.print(W.re, 7); Serial.print(",");
+  Serial.print(W.im, 7); Serial.print(",");
+  Serial.print(fxAbs(W), 7); Serial.print(",");
+  Serial.println(fxPhaseDeg(W), 4);
+  Serial.println("===========================================================");
+
+  return out;
+}
+
+FxCausalSegmentResult fxRunCausalSegment(const char *label,
+                                         bool controllerOn,
+                                         FxComplex W,
+                                         const FxBaseline &base,
+                                         PhaseTrackerState &tracker,
+                                         uint32_t durationMs) {
+  FxCausalSegmentResult out = {};
+  RunningStats axisStats[3];
+  RunningStats vecStats;
+  RunningStats refStats;
+  for (uint8_t a = 0; a < 3; a++) resetRunningStats(axisStats[a]);
+  resetRunningStats(vecStats);
+  resetRunningStats(refStats);
+
+  if (!controllerOn) {
+    setVisatonPhaseOffsetTargetDeg(0.0);
+    if (!setVisatonFxAmplitudeContinuous(0.0)) return out;
+  } else {
+    // One live-reference warm-up block establishes the frozen command before
+    // any ON-segment sample contributes to the causal statistics.
+    PairedTrackingWindow warm = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (!warm.valid || !fxWindowSafetyOk(warm)) return out;
+    FxComplex warmCenter, warmPred;
+    double warmPhase = 0.0;
+    if (!fxReferencePhasors(tracker, warm, base.referenceMeanMs2, warmCenter, warmPred, warmPhase)) return out;
+    double warmAmp = 0.0, warmCmdPhase = 0.0;
+    bool warmSat = false;
+    FxComplex warmW = W;
+    if (!fxApplyCommandFromW(warmW, warmPred, warmAmp, warmCmdPhase, warmSat)) return out;
+  }
+
+  uint32_t startMs = millis();
+  uint8_t badRef = 0;
+  while (millis() - startMs < durationMs) {
+    PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+    if (checkEmergencyStop()) return out;
+    if (!w.valid || !fxWindowSafetyOk(w)) continue;
+
+    FxComplex rCenter, rPred;
+    double refPredPhase = 0.0;
+    if (!fxReferencePhasors(tracker, w, base.referenceMeanMs2, rCenter, rPred, refPredPhase)) {
+      badRef++;
+      if (badRef >= FX_V13_MAX_REFERENCE_REJECT_BLOCKS) return out;
+      continue;
+    }
+    badRef = 0;
+
+    double cmdAmp = 0.0, cmdPhase = 0.0;
+    if (controllerOn) {
+      bool saturated = false;
+      FxComplex Wtemp = W;
+      if (!fxApplyCommandFromW(Wtemp, rPred, cmdAmp, cmdPhase, saturated)) return out;
+    } else {
+      if (!setVisatonFxAmplitudeContinuous(0.0)) return out;
+      cmdAmp = 0.0;
+      cmdPhase = 0.0;
+    }
+
+    for (uint8_t a = 0; a < 3; a++) pushRunningStats(axisStats[a], w.handAxis[a].amplitudeMs2);
+    pushRunningStats(vecStats, w.handVectorMs2);
+    pushRunningStats(refStats, w.toolAxis[phaseReferenceAxis].amplitudeMs2);
+
+    Serial.print("CSV_FX_ABAB,"); Serial.print(label); Serial.print(",");
+    Serial.print((millis() - startMs) / 1000.0, 3); Serial.print(",");
+    Serial.print(controllerOn ? 1 : 0); Serial.print(",");
+    Serial.print(refStats.mean, 6); Serial.print(",");
+    Serial.print(cmdAmp, 2); Serial.print(",");
+    Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+    Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+    Serial.println(w.handVectorMs2, 6);
+  }
+
+  out.validWindows = vecStats.n;
+  if (vecStats.n < 5) return out;
+  for (uint8_t a = 0; a < 3; a++) out.axisMeanMs2[a] = axisStats[a].mean;
+  out.vectorMeanMs2 = vecStats.mean;
+  out.referenceMeanMs2 = refStats.mean;
+  out.valid = true;
+  return out;
+}
+
+void runFxCausalAbab() {
+  if (!fxLastRunValid || !fxLastRunBaseline.valid || !fxSecondaryPathValid) {
+    Serial.println("b requires a completed valid frozen-W FxLMS run first.");
+    return;
+  }
+
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  Serial.println();
+  Serial.println("================ FXLMS A-B-A-B CAUSAL VALIDATION ================");
+  Serial.println("Keep TOOL ON continuously and DO NOT move the hand/mount.");
+  Serial.println("A1=controller OFF 5 s, B1=frozen controller ON 10 s, A2=OFF 5 s, B2=same controller ON 10 s.");
+  Serial.println("CSV_FX_ABAB_HEADER,Segment,t_s,ControllerOn,RunningRefMean,CmdAmp,X,Y,Z,Vector");
+
+  if (!visatonRunning && !startVisatonFxInitial(testFrequencyHz, 0.0)) {
+    stopVisaton();
+    automaticTestRunning = false;
+    Serial.println("A-B-A-B could not start the zero-amplitude NCO.");
+    return;
+  }
+
+  PhaseTrackerState tracker = {};
+  tracker.referenceAxis = phaseReferenceAxis;
+  FxCausalSegmentResult a1 = fxRunCausalSegment("A1", false, fxLastControllerW,
+                                                fxLastRunBaseline, tracker, FX_V13_CAUSAL_OFF_MS);
+  FxCausalSegmentResult b1 = fxRunCausalSegment("B1", true, fxLastControllerW,
+                                                fxLastRunBaseline, tracker, FX_V13_CAUSAL_ON_MS);
+  FxCausalSegmentResult a2 = fxRunCausalSegment("A2", false, fxLastControllerW,
+                                                fxLastRunBaseline, tracker, FX_V13_CAUSAL_OFF_MS);
+  FxCausalSegmentResult b2 = fxRunCausalSegment("B2", true, fxLastControllerW,
+                                                fxLastRunBaseline, tracker, FX_V13_CAUSAL_ON_MS);
+
+  if (!a1.valid || !b1.valid || !a2.valid || !b2.valid) {
+    Serial.println("A-B-A-B VALIDATION FAILED: one or more segments lacked valid reference/sensor data.");
+    goto fx_abab_cleanup;
+  }
+
+  {
+    uint8_t ai = axisIndex();
+    double offSel = 0.5 * (a1.axisMeanMs2[ai] + a2.axisMeanMs2[ai]);
+    double onSel = 0.5 * (b1.axisMeanMs2[ai] + b2.axisMeanMs2[ai]);
+    double offVec = 0.5 * (a1.vectorMeanMs2 + a2.vectorMeanMs2);
+    double onVec = 0.5 * (b1.vectorMeanMs2 + b2.vectorMeanMs2);
+    double selReduction = 100.0 * (1.0 - onSel / fmax(offSel, 1.0e-9));
+    double vecReduction = 100.0 * (1.0 - onVec / fmax(offVec, 1.0e-9));
+    double offRepeat = percentDifference(a1.axisMeanMs2[ai], a2.axisMeanMs2[ai]);
+    double onRepeat = percentDifference(b1.axisMeanMs2[ai], b2.axisMeanMs2[ai]);
+
+    Serial.println();
+    Serial.println("================ A-B-A-B SUMMARY ================");
+    Serial.print("Selected-axis OFF mean: "); Serial.println(offSel, 6);
+    Serial.print("Selected-axis ON mean:  "); Serial.println(onSel, 6);
+    Serial.print("Selected-axis causal reduction: "); Serial.print(selReduction, 3); Serial.println(" %");
+    Serial.print("Vector OFF mean: "); Serial.println(offVec, 6);
+    Serial.print("Vector ON mean:  "); Serial.println(onVec, 6);
+    Serial.print("Vector causal reduction: "); Serial.print(vecReduction, 3); Serial.println(" %");
+    Serial.print("OFF repeat difference A1/A2: "); Serial.print(offRepeat, 3); Serial.println(" %");
+    Serial.print("ON repeat difference B1/B2: "); Serial.print(onRepeat, 3); Serial.println(" %");
+    Serial.println("CSV_FX_ABAB_FINAL,SelectedOff,SelectedOn,SelectedReduction_pct,VectorOff,VectorOn,VectorReduction_pct,OffRepeatDiff_pct,OnRepeatDiff_pct");
+    Serial.print("CSV_FX_ABAB_FINAL,"); Serial.print(offSel, 7); Serial.print(",");
+    Serial.print(onSel, 7); Serial.print(","); Serial.print(selReduction, 4); Serial.print(",");
+    Serial.print(offVec, 7); Serial.print(","); Serial.print(onVec, 7); Serial.print(",");
+    Serial.print(vecReduction, 4); Serial.print(","); Serial.print(offRepeat, 4); Serial.print(",");
+    Serial.println(onRepeat, 4);
+    Serial.println("===================================================");
+  }
+
+fx_abab_cleanup:
+  stopVisaton();
+  automaticTestRunning = false;
+  Serial.println("A-B-A-B stage ended with VISATON OFF.");
+}
+
+void runFxLms(uint8_t adaptSeconds) {
+  if (!baselineValid || !baselineAxisSelected || !fxSecondaryPathValid ||
+      integratedWorkflowState != IntegratedWorkflowState::FXLMS_READY) {
+    Serial.println("Not ready for l. Normal order: TOOL ON -> a -> x/y/z -> TOOL OFF -> i -> TOOL ON -> l 20");
+    return;
+  }
+  adaptSeconds = static_cast<uint8_t>(clampDouble(adaptSeconds, FX_MIN_ADAPT_SECONDS, FX_MAX_ADAPT_SECONDS));
+
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  integratedWorkflowState = IntegratedWorkflowState::FXLMS_RUNNING;
+  fxLastRunValid = false;
+  fxLastSystemCandidateValid = false;
+  fxLastControllerW = fxMake(0.0, 0.0);
+  fxLastRunBaseline = {};
+  fxLastFrozen10Result = {};
+  fxLastExtended60Result = {};
+  fxLastExtended60Valid = false;
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("SINGLE-FREQUENCY COMPLEX NORMALIZED FXLMS V1.4 - AXIS CHARACTERIZATION");
+  Serial.println("TOOL ON. ADXL1 = live reference. ADXL2 selected axis = adaptive error.");
+  Serial.println("Core complex FxLMS equation is unchanged from V1.3; Wbest is selected-axis qualified.");
+  Serial.print("f0: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+  Serial.print("Error axis: ADXL2 "); Serial.println(axisChar());
+  Serial.print("Reference axis: ADXL1 "); Serial.println(axisCharFromIndex(phaseReferenceAxis));
+  Serial.print("S_hat gain/phase: "); Serial.print(fxSecondaryGainMs2PerDac, 8); Serial.print(" / ");
+  Serial.print(fxSecondaryPhaseDeg, 3); Serial.println(" deg");
+  Serial.print("Startup mu: "); Serial.print(FX_STARTUP_MU, 4);
+  Serial.print(" | learn mu: "); Serial.print(fxNormalMu, 4);
+  Serial.print(" | fine mu factor: "); Serial.println(FX_V13_FINE_MU_FACTOR, 3);
+  Serial.print("Maximum adaptive search duration: "); Serial.print(adaptSeconds); Serial.println(" s");
+  Serial.println("================================================================================");
+
+  {
+    FxBaseline base = {};
+    Serial.println("Acquiring fresh TOOL-ONLY baseline with neutral zero-amplitude NCO...");
+    if (!fxAcquireFreshToolBaseline(base)) {
+      Serial.println("FXLMS ABORT: fresh tool baseline/reference quality failed.");
+      goto fx_l_cleanup;
+    }
+
+    fxLastRunBaseline = base;
+
+    // Separate the identification probe amplitude from live-control authority.
+    double authorityEstimateDac = base.selectedMeanMs2 / fmax(fxSecondaryGainMs2PerDac, 1.0e-9);
+    double computedCeiling = FX_V13_AUTHORITY_FACTOR * authorityEstimateDac;
+    fxCommandMaxDac = clampDouble(computedCeiling,
+                                  FX_V13_CONTROL_CEILING_MIN_DAC,
+                                  FX_V13_CONTROL_CEILING_HARD_DAC);
+    fxLastControlCeilingDac = fxCommandMaxDac;
+
+    Serial.println("FXLMS_BASELINE,f0,RefAxis,ErrorAxis,RefAmp,X,Y,Z,Vector,ValidWindows");
+    Serial.print("FXLMS_BASELINE,"); Serial.print(testFrequencyHz, 6); Serial.print(",");
+    Serial.print(axisCharFromIndex(phaseReferenceAxis)); Serial.print(",");
+    Serial.print(axisChar()); Serial.print(",");
+    Serial.print(base.referenceMeanMs2, 6); Serial.print(",");
+    Serial.print(base.axisMeanMs2[0], 6); Serial.print(",");
+    Serial.print(base.axisMeanMs2[1], 6); Serial.print(",");
+    Serial.print(base.axisMeanMs2[2], 6); Serial.print(",");
+    Serial.print(base.vectorMeanMs2, 6); Serial.print(",");
+    Serial.println(base.validWindows);
+
+    Serial.print("First-order authority estimate: "); Serial.print(authorityEstimateDac, 3); Serial.println(" DAC");
+    Serial.print("Authority factor: "); Serial.println(FX_V13_AUTHORITY_FACTOR, 3);
+    Serial.print("V1.4 live-control ceiling: "); Serial.print(fxCommandMaxDac, 3); Serial.println(" DAC");
+    Serial.println("CSV_FX_AUTHORITY,SelectedBaseline,Sgain,AuthorityEstimateDAC,AuthorityFactor,ControlCeilingDAC,ProbeDAC");
+    Serial.print("CSV_FX_AUTHORITY,"); Serial.print(base.selectedMeanMs2, 7); Serial.print(",");
+    Serial.print(fxSecondaryGainMs2PerDac, 9); Serial.print(",");
+    Serial.print(authorityEstimateDac, 5); Serial.print(",");
+    Serial.print(FX_V13_AUTHORITY_FACTOR, 3); Serial.print(",");
+    Serial.print(fxCommandMaxDac, 3); Serial.print(",");
+    Serial.println(fxProbeDac, 3);
+
+    FxComplex W = fxMake(0.0, 0.0);
+    FxComplex bestW = fxMake(0.0, 0.0);
+    bool bestValid = false;
+    double bestRollingVectorReduction = -1.0e9;
+    double bestRollingSelectedReduction = -1.0e9;
+
+    PhaseTrackerState tracker = {};
+    tracker.referenceAxis = phaseReferenceAxis;
+    FxRollingPerformance rolling = {};
+    fxResetRollingPerformance(rolling);
+    FxRollingSummary roll = {};
+
+    FxAdaptiveState state = FxAdaptiveState::STARTUP;
+    uint32_t startMs = millis();
+    uint16_t coherentBlocks = 0;
+    uint16_t allReferenceValidBlocks = 0;
+    uint16_t saturatedBlocks = 0;
+    uint8_t consecutiveWindowInvalid = 0;
+    uint8_t consecutiveReferenceReject = 0;
+    uint8_t poorErrorHoldBlocks = 0;
+    uint8_t selectedGrowthCount = 0;
+    uint8_t vectorGrowthCount = 0;
+    uint8_t holdExitCount = 0;
+    uint8_t holdStableCount = 0;
+    bool finishForValidation = false;
+    const char *finishReason = "MAX_TIME";
+
+    Serial.println("CSV_FX_REJECT_HEADER,t_s,Reason,RefAmp,RefSync,ErrAmp,ErrSync,X,Y,Z,Vector,Wmag,Wphase,CmdAmp,State,RejectCount");
+    Serial.println("CSV_FXLMS_V14_HEADER,t_s,State,Mu,RefAmp,RefSync,RefPhase,DeltaF_Hz,ErrAmp,ErrSync,WI_Applied,WQ_Applied,WI_Next,WQ_Next,CmdAmp,CmdPhase,X,Y,Z,Vector,XReduction_pct,YReduction_pct,ZReduction_pct,SelectedReduction_pct,VectorReduction_pct,RollingSelectedReduction_pct,RollingVectorReduction_pct,BestValid,BestWI,BestWQ,BestRollingSelected_pct,BestRollingVector_pct,Saturated");
+
+    while (millis() - startMs < static_cast<uint32_t>(adaptSeconds) * 1000UL) {
+      PairedTrackingWindow w = acquirePairedTrackingWindow(FX_BLOCK_SAMPLES);
+      if (checkEmergencyStop()) goto fx_l_cleanup;
+      double tSec = (millis() - startMs) / 1000.0;
+
+      if (!w.valid) {
+        consecutiveWindowInvalid++;
+        fxPrintReject(tSec, "WINDOW_INVALID", nullptr, state, W, currentDacAmplitude, consecutiveWindowInvalid);
+        if (consecutiveWindowInvalid >= FX_MAX_CONSECUTIVE_INVALID) {
+          Serial.println("FXLMS ABORT: repeated invalid sensor/timing windows.");
+          goto fx_l_cleanup;
+        }
+        continue;
+      }
+      if (!fxWindowSafetyOk(w)) {
+        fxPrintReject(tSec, "ABSOLUTE_SAFETY_GUARD", &w, state, W, currentDacAmplitude, 1);
+        Serial.println("FXLMS ABORT: absolute sensor/software safety guard exceeded.");
+        goto fx_l_cleanup;
+      }
+      consecutiveWindowInvalid = 0;
+
+      FxComplex rCenter, rPred;
+      double refPredPhase = 0.0;
+      if (!fxReferencePhasors(tracker, w, base.referenceMeanMs2, rCenter, rPred, refPredPhase)) {
+        consecutiveReferenceReject++;
+        fxPrintReject(tSec, "REFERENCE_REJECT", &w, state, W, currentDacAmplitude, consecutiveReferenceReject);
+        if (consecutiveReferenceReject >= FX_V13_MAX_REFERENCE_REJECT_BLOCKS) {
+          Serial.println("FXLMS ABORT: live ADXL1 reference quality remained invalid.");
+          goto fx_l_cleanup;
+        }
+        continue;
+      }
+      consecutiveReferenceReject = 0;
+      allReferenceValidBlocks++;
+
+      const AxisSyncResult &errAxis = w.handAxis[axisIndex()];
+      double axisReductionPct[3];
+      for (uint8_t a = 0; a < 3; a++) {
+        axisReductionPct[a] = 100.0 * (1.0 - w.handAxis[a].amplitudeMs2 /
+                                      fmax(base.axisMeanMs2[a], 1.0e-9));
+      }
+      double selectedReduction = axisReductionPct[axisIndex()];
+      double vectorReduction = 100.0 * (1.0 - w.handVectorMs2 /
+                                        fmax(base.vectorMeanMs2, 1.0e-9));
+
+      // Hard safety remains independent of the learning supervisor.
+      if (errAxis.amplitudeMs2 > FX_SELECTED_GROWTH_ABORT_FACTOR * base.selectedMeanMs2) selectedGrowthCount++;
+      else selectedGrowthCount = 0;
+      if (w.handVectorMs2 > FX_VECTOR_COUPLING_ABORT_FACTOR * base.vectorMeanMs2) vectorGrowthCount++;
+      else vectorGrowthCount = 0;
+      if (selectedGrowthCount >= FX_GROWTH_ABORT_BLOCKS) {
+        Serial.println("FXLMS ABORT: SELECTED-AXIS GROWTH stayed >150% of baseline for three valid-reference blocks.");
+        goto fx_l_cleanup;
+      }
+      if (vectorGrowthCount >= FX_GROWTH_ABORT_BLOCKS) {
+        Serial.println("FXLMS ABORT: CROSS_AXIS_COUPLING_LIMIT - SYSTEM VECTOR stayed >200% of baseline for three valid-reference blocks.");
+        Serial.println("Interpretation: extreme cross-axis redistribution. This is not automatically a selected-axis FxLMS failure or wrong S_hat.");
+        goto fx_l_cleanup;
+      }
+
+      FxComplex Wapplied = W; // this coefficient generated the current measured response
+      bool errorCoherent = errAxis.amplitudeMs2 >= MIN_REPORT_AMPLITUDE_MS2 &&
+                           errAxis.syncRatio >= FX_MIN_ERROR_SYNC;
+      double residualRatio = errAxis.amplitudeMs2 / fmax(base.selectedMeanMs2, 1.0e-9);
+      double lowResidualGate = fmax(FX_LOW_RESIDUAL_ABS_MS2,
+                                    FX_LOW_RESIDUAL_FRACTION * base.selectedMeanMs2);
+      bool lowResidual = errAxis.amplitudeMs2 <= lowResidualGate;
+
+      // Poor error coherence no longer causes a 0.48-s hard abort. Freeze W and
+      // keep following the healthy live reference. Persistently bad error quality
+      // either falls back to a previously qualified Wbest or ends the run.
+      if (!errorCoherent) {
+        poorErrorHoldBlocks++;
+        if (lowResidual && bestValid) state = FxAdaptiveState::HOLD;
+
+        double cmdAmp = 0.0, cmdPhase = 0.0;
+        bool saturated = false;
+        if (!fxApplyCommandFromW(W, rPred, cmdAmp, cmdPhase, saturated)) {
+          Serial.println("FXLMS ABORT: failed to maintain actuator command during quality hold.");
+          goto fx_l_cleanup;
+        }
+        if (saturated) saturatedBlocks++;
+
+        fxPrintReject(tSec,
+                      lowResidual ? "LOW_RESIDUAL_INCOHERENT_HOLD" : "ERROR_INCOHERENT_TEMP_HOLD",
+                      &w, state, W, cmdAmp, poorErrorHoldBlocks);
+
+        if (poorErrorHoldBlocks >= FX_V13_MAX_ERROR_QUALITY_HOLD_BLOCKS) {
+          if (bestValid) {
+            W = bestW;
+            finishForValidation = true;
+            finishReason = "PERSISTENT_ERROR_QUALITY_RESTORE_WBEST";
+            Serial.println("Persistent error-quality loss: restoring qualified Wbest and proceeding to frozen validation.");
+            break;
+          }
+          Serial.println("FXLMS END: persistent error-quality loss and no acceptable stored controller. Re-identification/plant check required.");
+          goto fx_l_cleanup;
+        }
+        continue;
+      }
+      poorErrorHoldBlocks = 0;
+      coherentBlocks++;
+
+      // Current performance belongs to Wapplied, not the W that will be computed
+      // after this measurement. This avoids a one-block causality error in Wbest.
+      fxPushRollingPerformance(rolling, selectedReduction, vectorReduction, Wapplied);
+      roll = fxSummarizeRollingPerformance(rolling);
+
+      if (fxRollingEligibleForBest(roll)) {
+        // V1.4: selected-axis attenuation is the optimization/qualification goal.
+        // Vector is recorded at the same Wbest for later cross-axis analysis,
+        // but it cannot reject an otherwise valid X/Y/Z characterization W.
+        if (!bestValid ||
+            roll.meanSelectedReductionPct >
+                bestRollingSelectedReduction + FX_V14_BEST_SELECTED_IMPROVEMENT_EPS_PCT) {
+          bestValid = true;
+          bestW = Wapplied;
+          bestRollingSelectedReduction = roll.meanSelectedReductionPct;
+          bestRollingVectorReduction = roll.meanVectorReductionPct;
+          Serial.print("FX_AXIS_WBEST_UPDATE,t="); Serial.print(tSec, 3);
+          Serial.print(" s | axis="); Serial.print(axisChar());
+          Serial.print(" | W="); Serial.print(bestW.re, 6); Serial.print("+j"); Serial.print(bestW.im, 6);
+          Serial.print(" | rolling selected="); Serial.print(bestRollingSelectedReduction, 2);
+          Serial.print(" % | rolling vector(diagnostic)="); Serial.print(bestRollingVectorReduction, 2); Serial.println(" %");
+        }
+      }
+
+      // V1.4: no 10%/20% vector performance gate here. Ordinary cross-axis
+      // redistribution is part of the experiment and must be measured, not used
+      // to declare the selected-axis controller invalid. Selected-axis emergency
+      // protection remains at 150% of baseline; vector only aborts if it exceeds
+      // 200% of baseline for the required consecutive blocks.
+
+      // Stateful learning law with hysteresis. STARTUP remains exactly five
+      // coherent blocks. HOLD is only entered from a rolling-qualified candidate.
+      if (state == FxAdaptiveState::STARTUP) {
+        if (coherentBlocks > FX_STARTUP_BLOCKS) {
+          state = residualRatio <= FX_V13_FINE_RESIDUAL_RATIO
+              ? FxAdaptiveState::FINE : FxAdaptiveState::LEARN;
+        }
+      }
+
+      if (state == FxAdaptiveState::HOLD) {
+        if (residualRatio > FX_V13_HOLD_EXIT_RATIO) {
+          holdExitCount++;
+          if (holdExitCount >= FX_V13_HOLD_EXIT_COHERENT_BLOCKS) {
+            state = residualRatio > FX_V13_FINE_RESIDUAL_RATIO
+                ? FxAdaptiveState::LEARN : FxAdaptiveState::FINE;
+            holdExitCount = 0;
+            holdStableCount = 0;
+          }
+        } else {
+          holdExitCount = 0;
+          holdStableCount++;
+        }
+      } else if (state != FxAdaptiveState::STARTUP) {
+        if (residualRatio <= FX_V13_HOLD_ENTER_RATIO && fxRollingEligibleForBest(roll)) {
+          // Freeze the coefficient that actually generated the current response.
+          W = Wapplied;
+          state = FxAdaptiveState::HOLD;
+          holdExitCount = 0;
+          holdStableCount = 1;
+        } else {
+          state = residualRatio <= FX_V13_FINE_RESIDUAL_RATIO
+              ? FxAdaptiveState::FINE : FxAdaptiveState::LEARN;
+        }
+      }
+
+      double mu = 0.0;
+      if (state == FxAdaptiveState::STARTUP) mu = FX_STARTUP_MU;
+      else if (state == FxAdaptiveState::LEARN) mu = fxNormalMu;
+      else if (state == FxAdaptiveState::FINE)
+        mu = fmax(FX_MIN_USER_MU, FX_V13_FINE_MU_FACTOR * fxNormalMu);
+      else mu = 0.0;
+
+      if (mu > 0.0) {
+        FxComplex E = fxPolar(errAxis.amplitudeMs2, errAxis.phaseDeg);
+        FxComplex Xf = fxMul(fxSecondaryPath, rCenter);
+        double denom = fxAbs2(Xf) + FX_NORMALIZATION_EPS;
+        FxComplex grad = fxMul(fxConj(Xf), E);
+        FxComplex deltaW = fxScale(grad, -mu / denom);
+
+        double stepMag = fxAbs(deltaW);
+        if (stepMag > FX_MAX_WEIGHT_STEP_DAC && stepMag > 1.0e-12) {
+          deltaW = fxScale(deltaW, FX_MAX_WEIGHT_STEP_DAC / stepMag);
+        }
+        W = fxAdd(W, deltaW);
+      }
+
+      double cmdAmp = 0.0, cmdPhase = 0.0;
+      bool saturated = false;
+      if (!fxApplyCommandFromW(W, rPred, cmdAmp, cmdPhase, saturated)) {
+        Serial.println("FXLMS ABORT: failed to update actuator command.");
+        goto fx_l_cleanup;
+      }
+      if (saturated) saturatedBlocks++;
+
+      Serial.print("CSV_FXLMS_V14,"); Serial.print(tSec, 3); Serial.print(",");
+      Serial.print(fxAdaptiveStateName(state)); Serial.print(",");
+      Serial.print(mu, 5); Serial.print(",");
+      Serial.print(w.toolAxis[phaseReferenceAxis].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.toolAxis[phaseReferenceAxis].syncRatio, 4); Serial.print(",");
+      Serial.print(refPredPhase, 3); Serial.print(",");
+      Serial.print(tracker.filteredFrequencyErrorHz, 6); Serial.print(",");
+      Serial.print(errAxis.amplitudeMs2, 6); Serial.print(",");
+      Serial.print(errAxis.syncRatio, 4); Serial.print(",");
+      Serial.print(Wapplied.re, 6); Serial.print(",");
+      Serial.print(Wapplied.im, 6); Serial.print(",");
+      Serial.print(W.re, 6); Serial.print(",");
+      Serial.print(W.im, 6); Serial.print(",");
+      Serial.print(cmdAmp, 2); Serial.print(",");
+      Serial.print(cmdPhase, 3); Serial.print(",");
+      Serial.print(w.handAxis[0].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[1].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handAxis[2].amplitudeMs2, 6); Serial.print(",");
+      Serial.print(w.handVectorMs2, 6); Serial.print(",");
+      Serial.print(axisReductionPct[0], 3); Serial.print(",");
+      Serial.print(axisReductionPct[1], 3); Serial.print(",");
+      Serial.print(axisReductionPct[2], 3); Serial.print(",");
+      Serial.print(selectedReduction, 3); Serial.print(",");
+      Serial.print(vectorReduction, 3); Serial.print(",");
+      if (roll.full) Serial.print(roll.meanSelectedReductionPct, 3); else Serial.print("NA");
+      Serial.print(",");
+      if (roll.full) Serial.print(roll.meanVectorReductionPct, 3); else Serial.print("NA");
+      Serial.print(",");
+      Serial.print(bestValid ? 1 : 0); Serial.print(",");
+      if (bestValid) { Serial.print(bestW.re, 6); Serial.print(","); Serial.print(bestW.im, 6); }
+      else Serial.print("NA,NA");
+      Serial.print(",");
+      if (bestValid) Serial.print(bestRollingSelectedReduction, 3); else Serial.print("NA");
+      Serial.print(",");
+      if (bestValid) Serial.print(bestRollingVectorReduction, 3); else Serial.print("NA");
+      Serial.print(",");
+      Serial.println(saturated ? 1 : 0);
+
+      if (state == FxAdaptiveState::HOLD && bestValid &&
+          holdStableCount >= FX_V13_HOLD_EARLY_VALIDATE_BLOCKS) {
+        W = bestW;
+        finishForValidation = true;
+        finishReason = "STABLE_HOLD_EARLY_VALIDATION";
+        Serial.println("Stable HOLD persisted: restoring Wbest and ending adaptive search early for frozen validation.");
+        break;
+      }
+    }
+
+    if (coherentBlocks < 10) {
+      Serial.println("FXLMS END: too few coherent adaptive blocks for a defensible controller search.");
+      goto fx_l_cleanup;
+    }
+
+    if (!bestValid) {
+      Serial.println();
+      Serial.print("FXLMS RESULT: NO QUALIFIED "); Serial.print(axisChar());
+      Serial.println("-AXIS CONTROLLER FOUND in this run.");
+      Serial.println("No frozen validation is manufactured from an ineligible selected-axis W. Record this as a selected-axis non-convergent/insufficient-attenuation run.");
+      goto fx_l_cleanup;
+    }
+
+    if (!finishForValidation) finishReason = "MAX_ADAPTATION_TIME_USE_WBEST";
+    W = bestW;
+    fxLastControllerW = bestW;
+    fxLastSystemCandidateValid = true;
+
+    Serial.println();
+    Serial.println("ADAPTIVE AXIS SEARCH COMPLETE. Restoring rolling-qualified selected-axis Wbest for independent frozen validation.");
+    Serial.print("Finish reason: "); Serial.println(finishReason);
+    Serial.print("Wbest = "); Serial.print(bestW.re, 6); Serial.print(" + j"); Serial.println(bestW.im, 6);
+    Serial.print("|Wbest| = "); Serial.print(fxAbs(bestW), 6); Serial.print(" DAC | angle(Wbest) = ");
+    Serial.print(fxPhaseDeg(bestW), 3); Serial.println(" deg");
+    Serial.print("Training rolling selected reduction at Wbest selection: "); Serial.print(bestRollingSelectedReduction, 3); Serial.println(" %");
+    Serial.print("Training rolling vector change at axis-Wbest selection (diagnostic): "); Serial.print(bestRollingVectorReduction, 3); Serial.println(" %");
+    Serial.print("Saturated adaptive blocks: "); Serial.println(saturatedBlocks);
+    Serial.println("AXIS_WBEST_SELECTED_FROM_ADAPTATION");
+    Serial.println("FROZEN_VALIDATION_USES_NEW_DATA");
+
+    {
+      FxValidationResult v = fxRunFrozenValidation(bestW, base, tracker);
+      if (!v.valid) {
+        Serial.println("FXLMS FINAL VALIDATION FAILED quality/safety requirements.");
+        goto fx_l_cleanup;
+      }
+
+      fxLastRunValid = true;
+      Serial.println();
+      Serial.println("================= FXLMS V1.4 AXIS CHARACTERIZATION RESULT =================");
+      Serial.print("Control axis: ADXL2 "); Serial.println(axisChar());
+      Serial.print("Baseline X/Y/Z: ");
+      Serial.print(base.axisMeanMs2[0], 6); Serial.print(" / ");
+      Serial.print(base.axisMeanMs2[1], 6); Serial.print(" / ");
+      Serial.println(base.axisMeanMs2[2], 6);
+      Serial.print("Controlled X/Y/Z: ");
+      Serial.print(v.axisMeanMs2[0], 6); Serial.print(" / ");
+      Serial.print(v.axisMeanMs2[1], 6); Serial.print(" / ");
+      Serial.println(v.axisMeanMs2[2], 6);
+      Serial.print("Baseline vector -> controlled: "); Serial.print(base.vectorMeanMs2, 6);
+      Serial.print(" -> "); Serial.println(v.vectorMeanMs2, 6);
+      double finalAxisReductionPct[3];
+      for (uint8_t a = 0; a < 3; a++) {
+        finalAxisReductionPct[a] = 100.0 * (1.0 - v.axisMeanMs2[a] /
+                                           fmax(base.axisMeanMs2[a], 1.0e-9));
+      }
+      Serial.print("Frozen X reduction: "); Serial.print(finalAxisReductionPct[0], 3); Serial.println(" %");
+      Serial.print("Frozen Y reduction: "); Serial.print(finalAxisReductionPct[1], 3); Serial.println(" %");
+      Serial.print("Frozen Z reduction: "); Serial.print(finalAxisReductionPct[2], 3); Serial.println(" %");
+      Serial.print("Selected-axis frozen reduction: "); Serial.print(v.selectedReductionPercent, 3); Serial.println(" %");
+      Serial.print("Vector frozen reduction (diagnostic): "); Serial.print(v.vectorReductionPercent, 3); Serial.println(" %");
+      Serial.print("Selected-axis validation CV: "); Serial.print(v.selectedCvPercent, 3); Serial.println(" %");
+      Serial.print("Vector validation CV: "); Serial.print(v.vectorCvPercent, 3); Serial.println(" %");
+      Serial.print("Frozen Wbest magnitude/phase: "); Serial.print(fxAbs(bestW), 6); Serial.print(" DAC / ");
+      Serial.print(fxPhaseDeg(bestW), 3); Serial.println(" deg");
+
+      if (v.selectedReductionPercent >= FX_V13_BEST_MIN_SELECTED_REDUCTION_PCT) {
+        Serial.print("SELECTED "); Serial.print(axisChar());
+        Serial.println("-AXIS ATTENUATION VALIDATED IN FROZEN DATA.");
+        if (v.vectorReductionPercent > 0.0)
+          Serial.println("TRIAXIAL VECTOR BENEFIT ALSO OBSERVED (diagnostic, not an axis-pass gate).");
+        else
+          Serial.println("CROSS-AXIS / VECTOR PENALTY OBSERVED (reported, but does not invalidate the selected-axis characterization).");
+      } else if (v.selectedReductionPercent > 0.0) {
+        Serial.println("SELECTED-AXIS REDUCTION PRESENT, BUT BELOW THE 20% CHARACTERIZATION QUALIFICATION LEVEL IN FROZEN DATA.");
+      } else {
+        Serial.println("NO SELECTED-AXIS ATTENUATION IN FROZEN VALIDATION.");
+      }
+
+      Serial.println("===================================================================");
+      Serial.println("CSV_FXLMS_V14_FINAL,f0,ErrorAxis,RefAxis,BaseX,BaseY,BaseZ,BaseVector,CtrlX,CtrlY,CtrlZ,CtrlVector,XReduction_pct,YReduction_pct,ZReduction_pct,SelectedReduction_pct,VectorReduction_pct,SelectedCV_pct,VectorCV_pct,WI,WQ,Wmag,Wphase,ValidWindows,ControlCeilingDAC,TrainingRollSelected_pct,TrainingRollVectorDiagnostic_pct");
+      Serial.print("CSV_FXLMS_V14_FINAL,"); Serial.print(testFrequencyHz, 6); Serial.print(",");
+      Serial.print(axisChar()); Serial.print(",");
+      Serial.print(axisCharFromIndex(phaseReferenceAxis)); Serial.print(",");
+      Serial.print(base.axisMeanMs2[0], 6); Serial.print(",");
+      Serial.print(base.axisMeanMs2[1], 6); Serial.print(",");
+      Serial.print(base.axisMeanMs2[2], 6); Serial.print(",");
+      Serial.print(base.vectorMeanMs2, 6); Serial.print(",");
+      Serial.print(v.axisMeanMs2[0], 6); Serial.print(",");
+      Serial.print(v.axisMeanMs2[1], 6); Serial.print(",");
+      Serial.print(v.axisMeanMs2[2], 6); Serial.print(",");
+      Serial.print(v.vectorMeanMs2, 6); Serial.print(",");
+      Serial.print(finalAxisReductionPct[0], 3); Serial.print(",");
+      Serial.print(finalAxisReductionPct[1], 3); Serial.print(",");
+      Serial.print(finalAxisReductionPct[2], 3); Serial.print(",");
+      Serial.print(v.selectedReductionPercent, 3); Serial.print(",");
+      Serial.print(v.vectorReductionPercent, 3); Serial.print(",");
+      Serial.print(v.selectedCvPercent, 3); Serial.print(",");
+      Serial.print(v.vectorCvPercent, 3); Serial.print(",");
+      Serial.print(bestW.re, 7); Serial.print(",");
+      Serial.print(bestW.im, 7); Serial.print(",");
+      Serial.print(fxAbs(bestW), 7); Serial.print(",");
+      Serial.print(fxPhaseDeg(bestW), 4); Serial.print(",");
+      Serial.print(v.validWindows); Serial.print(",");
+      Serial.print(fxCommandMaxDac, 3); Serial.print(",");
+      Serial.print(bestRollingSelectedReduction, 3); Serial.print(",");
+      Serial.println(bestRollingVectorReduction, 3);
+
+      // ================================================================
+      // V1.4R AUTO60 TRIGGER
+      // ================================================================
+      // The extended test starts ONLY if the INDEPENDENT 10-s frozen
+      // validation itself qualifies the selected axis (>=20%). Training
+      // performance and vector performance cannot trigger this stage.
+      fxLastFrozen10Result = v;
+      if (v.selectedReductionPercent >= FX_V13_BEST_MIN_SELECTED_REDUCTION_PCT) {
+        Serial.println();
+        Serial.print("AUTO60 TRIGGER: 10-s frozen "); Serial.print(axisChar());
+        Serial.print(" attenuation = "); Serial.print(v.selectedReductionPercent, 3);
+        Serial.println(" % >= 20%. Continuing immediately into 60-s frozen persistence test.");
+        Serial.println("DO NOT MOVE: no user action is required; same Wbest/S_hat/f0/reference are retained.");
+
+        FxValidationResult ext60 = fxRunExtendedFrozenValidation60(bestW, base, tracker);
+        fxLastExtended60Result = ext60;
+        fxLastExtended60Valid = ext60.valid;
+
+        if (ext60.valid) {
+          Serial.println();
+          Serial.println("AUTO60 COMPLETE: extended frozen persistence dataset is VALID.");
+          Serial.print("10-s frozen selected attenuation: ");
+          Serial.print(v.selectedReductionPercent, 3); Serial.println(" %");
+          Serial.print("60-s frozen selected attenuation: ");
+          Serial.print(ext60.selectedReductionPercent, 3); Serial.println(" %");
+        } else {
+          Serial.println();
+          Serial.println("AUTO60 ENDED WITHOUT A VALID 60-s RESULT.");
+          Serial.println("The preceding valid 10-s frozen result remains valid and is NOT erased.");
+        }
+      } else {
+        Serial.println();
+        Serial.print("AUTO60 NOT STARTED: independent 10-s frozen selected-axis attenuation = ");
+        Serial.print(v.selectedReductionPercent, 3);
+        Serial.println(" %, below the 20% qualification threshold.");
+        Serial.println("Vector result is not used in this decision.");
+      }
+    }
+  }
+
+fx_l_cleanup:
+  stopVisaton();
+  automaticTestRunning = false;
+  if (emergencyStopRequested) {
+    baselineValid = false;
+    baselineAxisSelected = false;
+    fxSecondaryPathValid = false;
+    integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+    Serial.println("Emergency stop invalidated the sequence. Restart with TOOL ON -> a.");
+  } else {
+    integratedWorkflowState = fxSecondaryPathValid
+        ? IntegratedWorkflowState::FXLMS_READY
+        : IntegratedWorkflowState::AWAIT_TOOL_OFF;
+    Serial.println("FxLMS V1.4R stage ended with VISATON OFF.");
+    Serial.println("If mounting is unchanged, l may be repeated. If mounting changed, TOOL OFF -> i first. c/d remain optional.");
+  }
+}
+
+void runIntegratedDiscovery() {
+  stopVisaton();
+  targetAcquired = false;
+  clearSlopeHistory();
+  baselineValid = false;
+  baselineAxisSelected = false;
+  baselineF0Hz = 0.0;
+  frozenMatchDac = 0.0;
+  frozenMatchMeasuredMs2 = 0.0;
+  lastBestPhaseDeg = 0.0;
+  lastBestPhaseResidualMs2 = 0.0;
+  lastPhaseSweepValid = false;
+  phaseReferenceLeakageValid = false;
+  phaseReferenceAxisValid = false;
+  fxSecondaryPathValid = false;
+  fxSecondaryGainMs2PerDac = 0.0;
+  fxSecondaryPhaseDeg = 0.0;
+  fxSecondaryPath = fxMake(0.0, 0.0);
+  fxProbeDac = 0.0;
+  fxCommandMaxDac = 0.0;
+  fxLastControllerW = fxMake(0.0, 0.0);
+  fxLastRunValid = false;
+  fxLastRunBaseline = {};
+  fxLastSystemCandidateValid = false;
+  fxLastControlCeilingDac = 0.0;
+  fxLastFrozen10Result = {};
+  fxLastExtended60Result = {};
+  fxLastExtended60Valid = false;
+  for (uint8_t a = 0; a < 3; a++) {
+    phaseReferenceLeakageMs2[a] = 0.0;
+    phaseReferenceLeakRatio[a] = 999.0;
+  }
+  quickDacSweepDone = false;
+  for (uint8_t i = 0; i < QUICK_DAC_POINT_COUNT; i++) quickDacPoints[i] = {};
+  for (uint8_t a = 0; a < 3; a++) {
+    quickAxisReachable[a] = false;
+    quickAxisEstimatedDac[a] = 0.0;
+  }
+  integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("INTEGRATED STAGE A - TOOL/HAND NARROWBAND FFT + QUADRATURE BASELINE");
+  Serial.println("TOOL ON. VISATON OFF. Keep grip/mounting/knob state unchanged.");
+  Serial.print("Hard-coded search band: "); Serial.print(DISC_SEARCH_MIN_HZ, 1);
+  Serial.print(" .. "); Serial.print(DISC_SEARCH_MAX_HZ, 1); Serial.println(" Hz");
+  Serial.println("================================================================================");
+
+  if (!discAcquireThreeFftFrames()) {
+    Serial.println("BASELINE FAILED during FFT acquisition.");
+    return;
+  }
+
+  discAnalyzeIndependentFftResults();
+  discFindToolCandidates();
+  discPrintIndependentPeaks("ADXL1 TOOL - INDEPENDENT NARROWBAND DOMINANT PEAKS", discoveryToolFFT);
+  discPrintIndependentPeaks("ADXL2 HAND - INDEPENDENT NARROWBAND DOMINANT PEAKS", discoveryHandFFT);
+
+  if (discoveryCandidateCount == 0) {
+    Serial.println("NO TOOL CANDIDATE FOUND in 240..320 Hz. Baseline rejected.");
+    return;
+  }
+
+  Serial.println();
+  Serial.println("Validating tool candidates on ONE uninterrupted quadrature record...");
+  if (!discAcquireQuadratureRecord()) return;
+  for (uint8_t i = 0; i < discoveryCandidateCount; i++) discValidateCandidate(discoveryCandidates[i]);
+  discPrintCandidateTable();
+
+  int best = discBestCandidateIndexByScore();
+  if (best < 0) {
+    Serial.println("NO CANDIDATE PASSED quadrature quality validation. Repeat a under steady tool operation.");
+    return;
+  }
+
+  int second = discSecondBestCandidateIndexByScore(best);
+  bool uniqueWinner = true;
+  double runnerUpRatio = 999.0;
+  if (second >= 0 && discoveryCandidates[second].qualityScore > 0.0) {
+    runnerUpRatio = discoveryCandidates[best].qualityScore /
+                    discoveryCandidates[second].qualityScore;
+    uniqueWinner = runnerUpRatio >= DISC_AUTO_LOCK_SCORE_RATIO;
+  }
+
+  DiscoveryCandidate &winner = discoveryCandidates[best];
+  uint8_t totalConsensus = winner.toolFrequencyConsensusAxes + winner.handFrequencyConsensusAxes;
+  bool qualityFloor =
+      winner.toolWeightedLocalSync >= DISC_AUTO_LOCK_MIN_WEIGHTED_LOCAL_SYNC &&
+      winner.toolWeightedPhaseRmseDeg <= DISC_QUAD_MAX_PHASE_RMSE_DEG &&
+      winner.supportAxes >= DISC_AUTO_LOCK_MIN_SUPPORT_AXES &&
+      winner.toolFrequencyConsensusAxes >= DISC_MIN_TOOL_FREQ_CONSENSUS_AXES &&
+      totalConsensus >= DISC_MIN_TOTAL_FREQ_CONSENSUS_AXES;
+
+  Serial.println();
+  Serial.print("Best quality-weighted candidate: #"); Serial.print(best + 1);
+  Serial.print(" at "); Serial.print(winner.refinedHz, 6); Serial.println(" Hz");
+  Serial.print("Quality summary: FullSync="); Serial.print(winner.toolWeightedSync, 3);
+  Serial.print(" (diagnostic), LocalSync="); Serial.print(winner.toolWeightedLocalSync, 3);
+  Serial.print(", RMSE="); Serial.print(winner.toolWeightedPhaseRmseDeg, 2);
+  Serial.print(" deg, support axes="); Serial.print(winner.supportAxes);
+  Serial.print(", FFT consensus tool/hand="); Serial.print(winner.toolFrequencyConsensusAxes);
+  Serial.print("/"); Serial.println(winner.handFrequencyConsensusAxes);
+
+  if (!uniqueWinner) {
+    Serial.println("MULTIPLE CREDIBLE FREQUENCIES - CONTROLLER BASELINE ABORTED.");
+    Serial.print("Top/runner-up score ratio = "); Serial.print(runnerUpRatio, 3);
+    Serial.print(" < required "); Serial.println(DISC_AUTO_LOCK_SCORE_RATIO, 2);
+    Serial.println("This is genuine candidate ambiguity. Keep tool operation steady and repeat a.");
+    return;
+  }
+
+  if (!qualityFloor) {
+    Serial.println("UNIQUE FREQUENCY CANDIDATE FOUND, BUT QUALITY FLOOR NOT MET - BASELINE ABORTED.");
+    if (winner.toolWeightedLocalSync < DISC_AUTO_LOCK_MIN_WEIGHTED_LOCAL_SYNC) {
+      Serial.print("Local weighted sync "); Serial.print(winner.toolWeightedLocalSync, 3);
+      Serial.print(" < "); Serial.println(DISC_AUTO_LOCK_MIN_WEIGHTED_LOCAL_SYNC, 2);
+    }
+    if (winner.supportAxes < DISC_AUTO_LOCK_MIN_SUPPORT_AXES) {
+      Serial.println("No ADXL1 axis met the drift-tolerant local-sync/support gate.");
+    }
+    if (winner.toolFrequencyConsensusAxes < DISC_MIN_TOOL_FREQ_CONSENSUS_AXES ||
+        totalConsensus < DISC_MIN_TOTAL_FREQ_CONSENSUS_AXES) {
+      Serial.print("FFT frequency consensus insufficient: tool/hand = ");
+      Serial.print(winner.toolFrequencyConsensusAxes); Serial.print("/");
+      Serial.println(winner.handFrequencyConsensusAxes);
+    }
+    if (winner.toolWeightedPhaseRmseDeg > DISC_QUAD_MAX_PHASE_RMSE_DEG) {
+      Serial.print("Phase-fit RMSE "); Serial.print(winner.toolWeightedPhaseRmseDeg, 2);
+      Serial.print(" deg > "); Serial.print(DISC_QUAD_MAX_PHASE_RMSE_DEG, 1); Serial.println(" deg");
+    }
+    Serial.println("This is NOT candidate ambiguity; it is a signal-quality/stability rejection.");
+    return;
+  }
+
+  Serial.println("DRIFT-TOLERANT FREQUENCY QUALITY PASS.");
+  Serial.println("Whole-record SyncRatio is retained only as a diagnostic; local sync + phase stability + FFT consensus passed.");
+
+  Serial.println("CSV_DISCOVERY_QUALITY,f0_Hz,fullSync,localSync,phaseRMSE_deg,supportAxes,toolConsensus,handConsensus,score");
+  Serial.print("CSV_DISCOVERY_QUALITY,"); Serial.print(winner.refinedHz, 6); Serial.print(",");
+  Serial.print(winner.toolWeightedSync, 4); Serial.print(",");
+  Serial.print(winner.toolWeightedLocalSync, 4); Serial.print(",");
+  Serial.print(winner.toolWeightedPhaseRmseDeg, 3); Serial.print(",");
+  Serial.print(winner.supportAxes); Serial.print(",");
+  Serial.print(winner.toolFrequencyConsensusAxes); Serial.print(",");
+  Serial.print(winner.handFrequencyConsensusAxes); Serial.print(",");
+  Serial.println(winner.qualityScore, 5);
+
+  applyIntegratedBaseline(static_cast<uint8_t>(best));
+}
+
+void selectIntegratedAxis(char c) {
+  if (!baselineValid || integratedWorkflowState != IntegratedWorkflowState::AWAIT_AXIS) {
+    Serial.println("No valid baseline awaiting axis selection. TOOL ON, VISATON OFF, then run a first.");
+    return;
+  }
+
+  uint8_t idx = c == 'x' ? 0 : (c == 'y' ? 1 : 2);
+  const DiscoveryAxisQuadResult &q = baselineHandAtF0.axis[idx];
+  if (!q.valid || q.amplitudeMs2 < MIN_REPORT_AMPLITUDE_MS2) {
+    Serial.print("ADXL2 "); Serial.print(static_cast<char>(toupper(c)));
+    Serial.println(" @ f0 is LOW CONFIDENCE. Choose another valid axis or repeat baseline a.");
+    return;
+  }
+  if (q.amplitudeMs2 > AXIS_SOFTWARE_GUARD_MS2 * 0.80) {
+    Serial.println("Selected baseline amplitude is outside the matcher's allowed target range.");
+    return;
+  }
+
+  controlAxis = c == 'x' ? ControlAxis::X_AXIS :
+                c == 'y' ? ControlAxis::Y_AXIS : ControlAxis::Z_AXIS;
+  testFrequencyHz = baselineF0Hz;
+  targetAmplitudeMs2 = q.amplitudeMs2;
+  targetAcquired = false;
+  clearSlopeHistory();
+  baselineAxisSelected = true;
+  integratedWorkflowState = IntegratedWorkflowState::AWAIT_TOOL_OFF;
+
+  Serial.println();
+  Serial.println("====================================================================");
+  Serial.println("ERROR AXIS SELECTED");
+  Serial.print("Control axis: ADXL2 "); Serial.println(axisChar());
+  Serial.print("Common tool frequency f0: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+  Serial.print("Target amplitude at f0: "); Serial.print(targetAmplitudeMs2, 6); Serial.println(" m/s^2 peak");
+  Serial.print("Quick authority diagnostic: ");
+  if (!quickDacSweepDone) {
+    Serial.println("NOT RUN (optional for FxLMS)");
+  } else if (quickAxisReachable[axisIndex()]) {
+    Serial.print("REACHABLE | rough DAC estimate "); Serial.println(quickAxisEstimatedDac[axisIndex()], 2);
+  } else {
+    Serial.println("NOT PROVEN by sparse sweep; i will still test a conservative probe automatically.");
+  }
+  Serial.println("====================================================================");
+  Serial.println("NORMAL FXLMS: switch TOOL OFF, do not move the assembly, then enter i.");
+  Serial.println("OPTIONAL: run d for actuator authority and/or c for V5.1R amplitude matching.");
+}
+
+void runIntegratedAmplitudeMatch() {
+  if (!baselineValid || !baselineAxisSelected ||
+      integratedWorkflowState != IntegratedWorkflowState::AWAIT_TOOL_OFF) {
+    Serial.println("Not ready for matching. Optional c requires: a -> x/y/z -> TOOL OFF -> c");
+    return;
+  }
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("INTEGRATED STAGE B - V5.1R ADAPTIVE AMPLITUDE MATCH");
+  Serial.println("Operator confirmation received: TOOL OFF.");
+  Serial.print("Frequency: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+  Serial.print("Selected ADXL2 axis: "); Serial.println(axisChar());
+  Serial.print("Target: "); Serial.print(targetAmplitudeMs2, 6); Serial.println(" m/s^2 peak");
+  Serial.println("After lock the final DAC is stored and the amplitude servo is disabled.");
+  Serial.println("The integrated wrapper allows up to two bounded reacquisitions if the");
+  Serial.println("candidate/plant shifts before a stable servo lock is confirmed.");
+  Serial.println("================================================================================");
+
+  integratedWorkflowState = IntegratedWorkflowState::MATCHING;
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  targetAcquired = false;
+  stopVisaton();
+  clearSlopeHistory();
+
+  AcquisitionResult acq = {};
+  ServoState servo = {};
+  uint32_t startMs = millis();
+  bool success = false;
+  uint8_t integratedReacquires = 0;
+
+  while (!emergencyStopRequested) {
+    success = acquireAndServoLock(acq, servo);
+    if (success && visatonRunning) break;
+
+    if (acq.status == AcquireStatus::NONSTATIONARY &&
+        integratedReacquires < MAX_RUNTIME_REACQUIRES) {
+      integratedReacquires++;
+      Serial.println();
+      Serial.print("INTEGRATED CONTROLLED REACQUISITION ");
+      Serial.print(integratedReacquires); Serial.print(" / ");
+      Serial.println(MAX_RUNTIME_REACQUIRES);
+      Serial.println("The current plant state moved before lock; restarting the proven V5.1R acquisition.");
+      targetAcquired = false;
+      stopVisaton();
+      clearSlopeHistory();
+      if (!interruptibleDelay(500)) break;
+      continue;
+    }
+    break;
+  }
+
+  uint32_t elapsedMs = millis() - startMs;
+
+  if (success && !emergencyStopRequested && visatonRunning) {
+    frozenMatchDac = currentDacAmplitude;
+    frozenMatchMeasuredMs2 = lockedPoint.amplitudeMs2;
+
+    Serial.println();
+    Serial.println("================================================================================");
+    Serial.println("AMPLITUDE MATCH SUCCESS - PHASE-SWEEP HANDOFF");
+    Serial.print("f0: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+    Serial.print("Axis: ADXL2 "); Serial.println(axisChar());
+    Serial.print("Stored baseline target: "); Serial.print(targetAmplitudeMs2, 6); Serial.println(" m/s^2 peak");
+    Serial.print("Final locked measurement: "); Serial.print(frozenMatchMeasuredMs2, 6); Serial.println(" m/s^2 peak");
+    Serial.print("Final frozen DAC amplitude: "); Serial.println(frozenMatchDac, 2);
+    Serial.print("Actual NCO frequency at lock: "); Serial.print(actualNcoFrequencyHz(), 7); Serial.println(" Hz");
+    Serial.print("Total Stage-B time: "); Serial.print(elapsedMs / 1000.0, 3); Serial.println(" s");
+    Serial.print("Integrated reacquisitions used: "); Serial.println(integratedReacquires);
+    Serial.println("AMPLITUDE SERVO IS NOW DISABLED.");
+    Serial.println("The matched DAC is stored AND THE VISATON REMAINS RUNNING CONTINUOUSLY at this exact f0 + DAC.");
+    Serial.println("Running V2.0 ADXL1 actuator-leakage diagnostic now (tool is still expected OFF)...");
+    bool referenceReady = measurePhaseReferenceLeakageAfterMatch();
+    if (!referenceReady) {
+      Serial.println("WARNING: no trustworthy ADXL1 reference axis was proven after matching.");
+      Serial.println("You may inspect the printed leakage ratios; do not accept Stage-C results if the reference is actuator-dominated.");
+    }
+    Serial.println("Do not move the wearable. KEEP TOOL OFF and enter i for single-frequency secondary-path identification.");
+    Serial.println("The legacy tracked phase sweep w remains available as a diagnostic directly after c.");
+    Serial.println("FXLMS SECONDARY-PATH ID READY.");
+    Serial.println("================================================================================");
+    Serial.print("CSV_FIXED_MATCH,");
+    Serial.print(testFrequencyHz, 6); Serial.print(",");
+    Serial.print(axisChar()); Serial.print(",");
+    Serial.print(targetAmplitudeMs2, 6); Serial.print(",");
+    Serial.print(frozenMatchMeasuredMs2, 6); Serial.print(",");
+    Serial.print(frozenMatchDac, 2); Serial.print(",");
+    Serial.print(elapsedMs); Serial.print(",");
+    Serial.println(integratedReacquires);
+
+    // V1.6 intentionally keeps the actuator running continuously at the freshly
+    // matched command. No amplitude servo remains active after this handoff.
+    setVisatonPhaseOffsetTargetDeg(0.0);
+    waitForPhaseOffsetSettled(180, 1.0);
+    targetAcquired = false;
+    integratedWorkflowState = IntegratedWorkflowState::AWAIT_SECONDARY_ID;
+  } else {
+    Serial.println("AMPLITUDE MATCH FAILED.");
+    if (!emergencyStopRequested) {
+      stopVisaton();
+      integratedWorkflowState = baselineValid && baselineAxisSelected
+          ? IntegratedWorkflowState::AWAIT_TOOL_OFF
+          : IntegratedWorkflowState::NEED_BASELINE;
+      Serial.println("Tool is still expected OFF. You may retry c, or restart with a if the setup changed.");
+    } else {
+      baselineValid = false;
+      baselineAxisSelected = false;
+      baselineF0Hz = 0.0;
+      targetAcquired = false;
+      clearSlopeHistory();
+      integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+      Serial.println("Emergency stop invalidated this sequence. Restart with TOOL ON -> a.");
+    }
+  }
+
+  automaticTestRunning = false;
+}
+
+// ============================================================================
+// COMPLETE RUN / REACQUISITION LOGIC
+// ============================================================================
+
+bool acquireAndServoLock(AcquisitionResult &acq, ServoState &servo) {
+  acq = acquireTargetWithRestart();
+  printAcquisitionSummary(acq);
+  acceptAcquisition(acq);
+  if (!targetAcquired) return false;
+
+  if (!setVisatonAmplitudeContinuous(lockedPoint.dac)) return false;
+  resetServoState(servo);
+
+  if (!confirmCandidateForServo(acq, servo)) {
+    acq.success = false;
+    acq.status = AcquireStatus::NONSTATIONARY;
+    targetAcquired = false;
+    Serial.println("Candidate confirmation failed -> controlled reacquisition.");
+    return false;
+  }
+
+  ServoStatus lock = runServoAcquire(servo);
+  if (lock == ServoStatus::LOCKED) return true;
+
+  if (lock == ServoStatus::NEEDS_REACQUIRE) {
+    acq.success = false;
+    acq.status = AcquireStatus::NONSTATIONARY;
+    targetAcquired = false;
+  }
+  Serial.print("Servo lock failed with code "); Serial.println(static_cast<int>(lock));
+  return false;
+}
+
+CompleteRunResult runOneComplete(uint8_t runNumber, bool stopAtEnd) {
+  CompleteRunResult result = {};
+  uint32_t completeRunStartMs = millis();
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  targetAcquired = false;
+  stopVisaton();
+  clearSlopeHistory();
+
+  Serial.println("\n####################################################################");
+  Serial.print("V5.1R COMPLETE RUN "); Serial.println(runNumber);
+  Serial.println("####################################################################");
+  Serial.print("Frequency: "); Serial.print(testFrequencyHz, 5); Serial.println(" Hz");
+  Serial.print("Axis: "); Serial.println(axisChar());
+  Serial.print("Target: "); Serial.print(targetAmplitudeMs2, 5); Serial.println(" m/s^2 peak");
+  Serial.print("Closed-loop hold: "); Serial.print(holdSeconds); Serial.println(" s");
+  Serial.println("Tool OFF. Do not touch the mechanical setup during the run.");
+
+  // Calibration/matching timer starts immediately before the control sequence,
+  // excluding only the run-identification banner above. Serial diagnostics emitted
+  // during acquisition remain part of the measured real test wall time.
+  uint32_t matchSequenceStartMs = millis();
+
+  ServoState servo;
+  resetServoState(servo);
+
+  uint8_t runtimeReacquires = 0;
+
+  while (true) {
+    if (!acquireAndServoLock(result.acquisition, servo)) {
+      if (emergencyStopRequested) break;
+      if (result.acquisition.status == AcquireStatus::NONSTATIONARY &&
+          runtimeReacquires < MAX_RUNTIME_REACQUIRES) {
+        runtimeReacquires++;
+        Serial.print("Runtime reacquisition attempt "); Serial.println(runtimeReacquires);
+        continue;
+      }
+      break;
+    }
+
+    if (!result.matchLockAchieved) {
+      result.matchLockAchieved = true;
+      result.matchLockTimeMs = millis() - matchSequenceStartMs;
+      Serial.println("\n---------------- MATCH TIMING ----------------");
+      Serial.print("Run "); Serial.print(runNumber);
+      Serial.print(" Stage-1 acquisition: "); Serial.print(result.acquisition.elapsedMs / 1000.0, 3); Serial.println(" s");
+      Serial.print("Run "); Serial.print(runNumber);
+      Serial.print(" successful amplitude-match + servo-lock time: ");
+      Serial.print(result.matchLockTimeMs / 1000.0, 3); Serial.println(" s");
+      Serial.println("CSV_MATCH_TIME,Run,AcqTime_ms,MatchLockTime_ms");
+      Serial.print("CSV_MATCH_TIME,"); Serial.print(runNumber); Serial.print(",");
+      Serial.print(result.acquisition.elapsedMs); Serial.print(",");
+      Serial.println(result.matchLockTimeMs);
+      Serial.println("------------------------------------------------");
+    }
+
+    HoldResult hold = runClosedLoopHold(holdSeconds, servo);
+    hold.reacquireEvents = runtimeReacquires;
+
+    if (hold.status == ServoStatus::NEEDS_REACQUIRE &&
+        runtimeReacquires < MAX_RUNTIME_REACQUIRES && !emergencyStopRequested) {
+      runtimeReacquires++;
+      Serial.print("Hold requested REACQUIRE. Restarting controlled hold. Cycle ");
+      Serial.println(runtimeReacquires);
+      targetAcquired = false;
+      continue;
+    }
+
+    result.hold = hold;
+    result.completed = hold.completed;
+    result.amplitudePass = hold.amplitudePass;
+    if (hold.phaseSweepReady && hold.completed) rememberWarmStart(currentDacAmplitude);
+
+    if (visatonRunning) {
+      VectorFftResult fft = {};
+      if (runLocalVectorFft(fft)) result.fft = fft;
+      printFftResult(result.fft);
+    }
+
+    result.finalDac = currentDacAmplitude;
+    // Amplitude matcher validation ends here. Destructive-interference phase
+    // optimization is intentionally handled by the subsequent phase-sweep test.
+    result.cancellationReady = false;
+    break;
+  }
+
+  Serial.println("\n===================== FINAL V5.1R AMPLITUDE VERDICT ===================");
+  Serial.print("AMPLITUDE CONTROL: "); Serial.println(result.amplitudePass ? "PASS" : "FAIL");
+  Serial.print("AMPLITUDE PHASE-SWEEP READY: "); Serial.println(result.hold.phaseSweepReady ? "YES" : "NO");
+  Serial.print("VECTOR FFT: "); Serial.println(result.fft.valid ? "PASS" : "FAIL/NOT EVALUATED");
+  Serial.println("PHASE/CANCELLATION VERDICT: DEFERRED TO PHASE-SWEEP EXPERIMENT");
+  Serial.println("============================================================");
+
+  result.totalRunTimeMs = millis() - completeRunStartMs;
+  Serial.print("TOTAL RUN TIME: "); Serial.print(result.totalRunTimeMs / 1000.0, 3); Serial.println(" s");
+
+  if (stopAtEnd || !result.completed || emergencyStopRequested) stopVisaton();
+  automaticTestRunning = false;
+  return result;
+}
+
+void printRunCsvHeader() {
+  Serial.println("CSV_SUMMARY_HEADER,Run,Completed,AmplitudePass,Axis,Freq_Hz,Target_mps2,FinalDAC,MeanAmp,MeanErr_pct,HoldCV_pct,RMS_Error_pct,MaxAbsError_pct,TightInBand_pct,FinalInBand_pct,DACmin,DACmax,Corrections,Reacquires,AcqRecords,AcqRejects,AcqRestarts,AcqTime_ms,MatchLockTime_ms,TotalRunTime_ms,FFT_Hz,FFT_SNR_dB");
+}
+
+void printRunCsv(uint8_t run, const CompleteRunResult &r) {
+  Serial.print("CSV_SUMMARY,");
+  Serial.print(run); Serial.print(",");
+  Serial.print(r.completed ? 1 : 0); Serial.print(",");
+  Serial.print(r.amplitudePass ? 1 : 0); Serial.print(",");
+  Serial.print(axisChar()); Serial.print(",");
+  Serial.print(testFrequencyHz, 5); Serial.print(",");
+  Serial.print(targetAmplitudeMs2, 5); Serial.print(",");
+  Serial.print(r.finalDac, 2); Serial.print(",");
+  Serial.print(r.hold.meanAmplitudeMs2, 5); Serial.print(",");
+  Serial.print(r.hold.meanErrorPercent, 2); Serial.print(",");
+  Serial.print(r.hold.cvPercent, 2); Serial.print(",");
+  Serial.print(r.hold.rmsErrorPercent, 2); Serial.print(",");
+  Serial.print(r.hold.maxAbsErrorPercent, 2); Serial.print(",");
+  Serial.print(r.hold.tightInBandPercent, 1); Serial.print(",");
+  Serial.print(r.hold.finalInBandPercent, 1); Serial.print(",");
+  Serial.print(r.hold.minDac, 2); Serial.print(",");
+  Serial.print(r.hold.maxDac, 2); Serial.print(",");
+  Serial.print(r.hold.corrections); Serial.print(",");
+  Serial.print(r.hold.reacquireEvents); Serial.print(",");
+  Serial.print(r.acquisition.recordsMeasured); Serial.print(",");
+  Serial.print(r.acquisition.qualityRejects); Serial.print(",");
+  Serial.print(r.acquisition.restarts); Serial.print(",");
+  Serial.print(r.acquisition.elapsedMs); Serial.print(",");
+  Serial.print(r.matchLockTimeMs); Serial.print(",");
+  Serial.print(r.totalRunTimeMs); Serial.print(",");
+  Serial.print(r.fft.frequencyHz, 5); Serial.print(",");
+  Serial.println(r.fft.snrDb, 2);
+}
+
+void runIndependentValidation() {
+  Serial.println("\n####################################################################");
+  Serial.println("V5.1R INDEPENDENT AMPLITUDE VALIDATION SERIES");
+  Serial.println("Each run starts from a fresh actuator/NCO state.");
+  Serial.println("####################################################################");
+  printRunCsvHeader();
+
+  uint8_t completed = 0;
+  uint8_t ampPasses = 0;
+  RunningStats matchTimeStats;
+  RunningStats acquisitionTimeStats;
+  resetRunningStats(matchTimeStats);
+  resetRunningStats(acquisitionTimeStats);
+
+  for (uint8_t run = 1; run <= independentRuns; run++) {
+    CompleteRunResult r = runOneComplete(run, true);
+    printRunCsv(run, r);
+    if (r.completed) completed++;
+    if (r.amplitudePass) ampPasses++;
+    if (r.matchLockAchieved) {
+      pushRunningStats(matchTimeStats, r.matchLockTimeMs / 1000.0);
+      pushRunningStats(acquisitionTimeStats, r.acquisition.elapsedMs / 1000.0);
+    }
+
+    if (emergencyStopRequested) break;
+    delay(500);
+  }
+
+  Serial.println("\nSERIES SUMMARY");
+  Serial.print("Completed: "); Serial.print(completed); Serial.print(" / "); Serial.println(independentRuns);
+  Serial.print("Amplitude PASS: "); Serial.print(ampPasses); Serial.print(" / "); Serial.println(independentRuns);
+  if (matchTimeStats.n > 0) {
+    double matchSd = runningSd(matchTimeStats);
+    double matchCv = matchTimeStats.mean > 1.0e-12 ? 100.0 * matchSd / matchTimeStats.mean : 0.0;
+    Serial.println("\nCALIBRATION / MATCH-TIME SUMMARY (successful locks only)");
+    Serial.print("Successful locks: "); Serial.println(matchTimeStats.n);
+    Serial.print("Acquisition time mean: "); Serial.print(acquisitionTimeStats.mean, 3); Serial.println(" s");
+    Serial.print("Match+servo-lock mean: "); Serial.print(matchTimeStats.mean, 3); Serial.println(" s");
+    Serial.print("Match+servo-lock SD: "); Serial.print(matchSd, 3); Serial.println(" s");
+    Serial.print("Match+servo-lock CV: "); Serial.print(matchCv, 2); Serial.println(" %");
+    Serial.print("Match+servo-lock min/max: "); Serial.print(matchTimeStats.minValue, 3);
+    Serial.print(" / "); Serial.print(matchTimeStats.maxValue, 3); Serial.println(" s");
+    Serial.println("CSV_MATCH_SERIES,SuccessfulLocks,AcqMean_s,MatchMean_s,MatchSD_s,MatchCV_pct,MatchMin_s,MatchMax_s");
+    Serial.print("CSV_MATCH_SERIES,"); Serial.print(matchTimeStats.n); Serial.print(",");
+    Serial.print(acquisitionTimeStats.mean, 3); Serial.print(",");
+    Serial.print(matchTimeStats.mean, 3); Serial.print(",");
+    Serial.print(matchSd, 3); Serial.print(",");
+    Serial.print(matchCv, 2); Serial.print(",");
+    Serial.print(matchTimeStats.minValue, 3); Serial.print(",");
+    Serial.println(matchTimeStats.maxValue, 3);
+  }
+}
+
+// ============================================================================
+// MANUAL / DIAGNOSTIC COMMANDS
+// ============================================================================
+
+void runMatchOnly() {
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  targetAcquired = false;
+  stopVisaton();
+  clearSlopeHistory();
+
+  AcquisitionResult acq;
+  ServoState servo;
+  uint32_t matchStartMs = millis();
+  if (acquireAndServoLock(acq, servo)) {
+    uint32_t matchTimeMs = millis() - matchStartMs;
+    Serial.println("\nMATCH + SERVO LOCK SUCCESS.");
+    Serial.print("Acquisition time: "); Serial.print(acq.elapsedMs / 1000.0, 3); Serial.println(" s");
+    Serial.print("Match + servo-lock time: "); Serial.print(matchTimeMs / 1000.0, 3); Serial.println(" s");
+    Serial.print("CSV_MATCH_ONLY,"); Serial.print(acq.elapsedMs); Serial.print(","); Serial.println(matchTimeMs);
+    Serial.print("Visaton left running at DAC "); Serial.println(currentDacAmplitude, 2);
+    Serial.println("Use k 30 to continue TRACK, g for FFT, or s to stop.");
+  } else {
+    Serial.println("MATCH/SERVO LOCK FAILED.");
+    if (!emergencyStopRequested) stopVisaton();
+  }
+  automaticTestRunning = false;
+}
+
+void runTrackCurrent(uint32_t seconds) {
+  if (!targetAcquired || !visatonRunning) {
+    Serial.println("No acquired/running target. Run m first.");
+    return;
+  }
+
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+  ServoState servo;
+  resetServoState(servo);
+  servo.plantBaseline = lockedPlantBaseline;
+
+  HoldResult h = runClosedLoopHold(static_cast<uint8_t>(clampDouble(seconds, 5, 30)), servo);
+  if (seconds > 30) {
+    Serial.println("Note: k durations >30 s are executed in <=30 s blocks to keep summary counters bounded.");
+    uint32_t remaining = seconds - 30;
+    while (remaining > 0 && h.status == ServoStatus::COMPLETED && !emergencyStopRequested) {
+      uint8_t block = static_cast<uint8_t>(remaining > 30 ? 30 : remaining);
+      h = runClosedLoopHold(block, servo);
+      remaining -= block;
+    }
+  }
+
+  automaticTestRunning = false;
+}
+
+void runDiagnostic(double dac) {
+  automaticTestRunning = true;
+  emergencyStopRequested = false;
+
+  Serial.println("\n============================================================");
+  Serial.println("FIXED-DAC CANONICAL DIAGNOSTIC - NO SEARCH / NO TRACK");
+  Serial.print("Frequency "); Serial.print(testFrequencyHz, 5);
+  Serial.print(" Hz | DAC "); Serial.println(quantizeDac(dac), 2);
+  Serial.println("============================================================");
+
+  double oldDac = currentDacAmplitude;
+  if (!setVisatonAmplitudeContinuous(dac)) {
+    automaticTestRunning = false;
+    return;
+  }
+  if (!interruptibleDelay(adaptiveSettleMs(oldDac, quantizeDac(dac)))) {
+    automaticTestRunning = false;
+    return;
+  }
+
+  for (uint8_t i = 1; i <= 3; i++) {
+    ControlRecord r = measureControlRecord(dac, false);
+    printControlRecord("DIAG", i, r);
+  }
+  automaticTestRunning = false;
+}
+
+void printIntegratedSettings() {
+  Serial.println();
+  Serial.println("--- INTEGRATED SETTINGS / STATUS ---");
+  Serial.print("Hard-coded tool search band: "); Serial.print(DISC_SEARCH_MIN_HZ, 1);
+  Serial.print(" .. "); Serial.print(DISC_SEARCH_MAX_HZ, 1); Serial.println(" Hz");
+  Serial.print("ADXL1 role: TOOL / reference on GPIO"); Serial.println(PIN_CS_ADXL1);
+  Serial.print("ADXL2 role: BACK-OF-HAND error sensor on GPIO"); Serial.println(PIN_CS_ADXL2);
+  Serial.print("Raw clipping guard: +/-"); Serial.print(ADXL_RAW_CLIP_LIMIT); Serial.println(" counts");
+  Serial.print("Baseline valid: "); Serial.println(baselineValid ? "YES" : "NO");
+  if (baselineValid) {
+    Serial.print("Baseline f0: "); Serial.print(baselineF0Hz, 6); Serial.println(" Hz");
+    Serial.print("ADXL2 X/Y/Z @ f0: ");
+    Serial.print(baselineHandAtF0.axis[0].amplitudeMs2, 5); Serial.print(" / ");
+    Serial.print(baselineHandAtF0.axis[1].amplitudeMs2, 5); Serial.print(" / ");
+    Serial.println(baselineHandAtF0.axis[2].amplitudeMs2, 5);
+  }
+  Serial.print("Quick DAC authority sweep completed: "); Serial.println(quickDacSweepDone ? "YES" : "NO");
+  if (quickDacSweepDone) {
+    Serial.print("Quick reachability X/Y/Z: ");
+    Serial.print(quickAxisReachable[0] ? "YES" : "NO"); Serial.print(" / ");
+    Serial.print(quickAxisReachable[1] ? "YES" : "NO"); Serial.print(" / ");
+    Serial.println(quickAxisReachable[2] ? "YES" : "NO");
+  }
+  Serial.print("Axis selected: "); Serial.println(baselineAxisSelected ? "YES" : "NO");
+  if (baselineAxisSelected) {
+    Serial.print("Control axis: "); Serial.println(axisChar());
+    Serial.print("Matcher frequency: "); Serial.print(testFrequencyHz, 6); Serial.println(" Hz");
+    Serial.print("Matcher target: "); Serial.print(targetAmplitudeMs2, 6); Serial.println(" m/s^2 peak");
+  }
+  Serial.print("Visaton running: "); Serial.println(visatonRunning ? "YES" : "NO");
+  if (visatonRunning) {
+    Serial.print("Current DAC: "); Serial.println(currentDacAmplitude, 2);
+    Serial.print("Actual NCO frequency: "); Serial.print(actualNcoFrequencyHz(), 7); Serial.println(" Hz");
+    Serial.print("Current phase offset: "); Serial.print(getCurrentVisatonPhaseOffsetDeg(), 2); Serial.println(" deg");
+  }
+  Serial.print("Stored matched DAC: ");
+  if (frozenMatchDac >= DAC_MIN - 1.0e-9) Serial.println(frozenMatchDac, 2);
+  else Serial.println("NONE");
+  Serial.print("Last tool-referenced phase sweep valid: "); Serial.println(lastPhaseSweepValid ? "YES" : "NO");
+  if (lastPhaseSweepValid) {
+    Serial.print("Last best relative beta/residual: "); Serial.print(lastBestPhaseDeg, 2);
+    Serial.print(" deg / "); Serial.print(lastBestPhaseResidualMs2, 6); Serial.println(" m/s^2");
+  }
+  Serial.print("FxLMS secondary path valid: "); Serial.println(fxSecondaryPathValid ? "YES" : "NO");
+  if (fxSecondaryPathValid) {
+    Serial.print("S_hat gain/phase: "); Serial.print(fxSecondaryGainMs2PerDac, 8);
+    Serial.print(" m/s2/DAC / "); Serial.print(fxSecondaryPhaseDeg, 3); Serial.println(" deg");
+    Serial.print("FxLMS normal mu: "); Serial.println(fxNormalMu, 5);
+    Serial.print("FxLMS current/provisional command ceiling: "); Serial.println(fxCommandMaxDac, 2);
+    Serial.print("V1.3 authority factor / hard live ceiling: "); Serial.print(FX_V13_AUTHORITY_FACTOR, 2);
+    Serial.print(" / "); Serial.println(FX_V13_CONTROL_CEILING_HARD_DAC, 2);
+    Serial.print("Last supervised live ceiling: "); Serial.println(fxLastControlCeilingDac, 2);
+    Serial.print("Last frozen FxLMS run valid: "); Serial.println(fxLastRunValid ? "YES" : "NO");
+    Serial.print("Last automatic 60-s frozen result valid: "); Serial.println(fxLastExtended60Valid ? "YES" : "NO");
+    if (fxLastExtended60Valid) {
+      Serial.print("Last 60-s selected-axis attenuation: ");
+      Serial.print(fxLastExtended60Result.selectedReductionPercent, 3); Serial.println(" %");
+    }
+  }
+  Serial.print("Workflow state: ");
+  switch (integratedWorkflowState) {
+    case IntegratedWorkflowState::NEED_BASELINE: Serial.println("NEED_BASELINE"); break;
+    case IntegratedWorkflowState::AWAIT_AXIS: Serial.println("AWAIT_AXIS"); break;
+    case IntegratedWorkflowState::AWAIT_TOOL_OFF: Serial.println("AWAIT_TOOL_OFF_CONFIRMATION"); break;
+    case IntegratedWorkflowState::MATCHING: Serial.println("MATCHING"); break;
+    case IntegratedWorkflowState::AWAIT_PHASE_TOOL_ON: Serial.println("AWAIT_PHASE_TOOL_ON / LEGACY_PHASE_READY"); break;
+    case IntegratedWorkflowState::PHASE_SWEEP_RUNNING: Serial.println("PHASE_SWEEP_RUNNING"); break;
+    case IntegratedWorkflowState::AWAIT_SECONDARY_ID: Serial.println("AWAIT_SECONDARY_ID / TOOL_OFF -> i"); break;
+    case IntegratedWorkflowState::FXLMS_READY: Serial.println("FXLMS_READY / TOOL_ON -> l"); break;
+    case IntegratedWorkflowState::FXLMS_RUNNING: Serial.println("FXLMS_RUNNING"); break;
+  }
+  Serial.println("------------------------------------");
+}
+
+void printIntegratedHelp() {
+  Serial.println();
+  Serial.println("============================================================");
+  Serial.println("KK INTEGRATED FFT/QUAD + V5.1R + COMPLEX FXLMS V1.4R AUTO60 CX2 AXIS CHARACTERIZATION");
+  Serial.println("------------------------------------------------------------");
+  Serial.println("a       TOOL ON + Visaton OFF: acquire 240..320 Hz baseline");
+  Serial.println("x/y/z   choose ONE ADXL2 error axis immediately after a");
+  Serial.println("i       TOOL OFF: robust probe survey + identify S_hat(f0) [FxLMS required]");
+  Serial.println("l 20    TOOL ON: FxLMS search -> Wbest -> 10 s frozen; if >=20% selected-axis attenuation, AUTO 60 s frozen persistence");
+  Serial.println("u 0.02  set LEARN mu [0.001..0.100]; FINE uses 0.5x this value");
+  Serial.println("b       TOOL ON: after a valid l run, perform OFF-ON-OFF-ON causal validation");
+  Serial.println();
+  Serial.println("OPTIONAL DIAGNOSTICS (fully retained):");
+  Serial.println("d       TOOL OFF: quick triaxial actuator DAC authority sweep");
+  Serial.println("c       TOOL OFF: V5.1R amplitude match + ADXL1 leakage check");
+  Serial.println("w       legacy TOOL-ON tracked phase sweep; still requires successful c");
+  Serial.println("g       diagnostic local triaxial FFT while Visaton is running");
+  Serial.println("p       print integrated settings/status");
+  Serial.println("s       immediate stop and reset complete workflow");
+  Serial.println("?       help");
+  Serial.println("------------------------------------------------------------");
+  Serial.println("NORMAL FXLMS ORDER:");
+  Serial.println("  TOOL ON  -> a -> x/y/z");
+  Serial.println("  TOOL OFF -> i");
+  Serial.println("  TOOL ON  -> let it stabilize -> l 20  [qualified 10-s frozen result automatically continues into 60-s frozen test]");
+  Serial.println();
+  Serial.println("OPTIONAL CHARACTERIZATION ORDER:");
+  Serial.println("  a -> d -> x/y/z -> c -> i -> l 20");
+  Serial.println("FxLMS does NOT require actuator amplitude matching.");
+  Serial.println("Without c, i automatically finds a conservative coherent probe DAC.");
+  Serial.println("V1.4R stores Wbest from 5-block rolling SELECTED-AXIS improvement; vector is diagnostic only. Qualified 10-s frozen validation automatically starts a 60-s frozen persistence test.");
+  Serial.println("All ADXL2 X/Y/Z amplitudes, per-axis reductions, vector, controller state, rejected blocks and axis-Wbest are logged.");
+  Serial.println("============================================================");
+}
+
+const char *skipSpacesIntegrated(const char *p) {
+  while (*p == ' ' || *p == '\t') p++;
+  return p;
+}
+
+void resetIntegratedWorkflowAfterStop() {
+  stopVisaton();
+  targetAcquired = false;
+  clearSlopeHistory();
+  baselineValid = false;
+  baselineAxisSelected = false;
+  baselineF0Hz = 0.0;
+  frozenMatchDac = 0.0;
+  frozenMatchMeasuredMs2 = 0.0;
+  lastBestPhaseDeg = 0.0;
+  lastBestPhaseResidualMs2 = 0.0;
+  lastPhaseSweepValid = false;
+  phaseReferenceLeakageValid = false;
+  phaseReferenceAxisValid = false;
+  fxSecondaryPathValid = false;
+  fxSecondaryGainMs2PerDac = 0.0;
+  fxSecondaryPhaseDeg = 0.0;
+  fxSecondaryPath = fxMake(0.0, 0.0);
+  fxProbeDac = 0.0;
+  fxCommandMaxDac = 0.0;
+  fxLastControllerW = fxMake(0.0, 0.0);
+  fxLastRunValid = false;
+  fxLastFrozen10Result = {};
+  fxLastExtended60Result = {};
+  fxLastExtended60Valid = false;
+  for (uint8_t a = 0; a < 3; a++) {
+    phaseReferenceLeakageMs2[a] = 0.0;
+    phaseReferenceLeakRatio[a] = 999.0;
+  }
+  quickDacSweepDone = false;
+  for (uint8_t i = 0; i < QUICK_DAC_POINT_COUNT; i++) quickDacPoints[i] = {};
+  for (uint8_t a = 0; a < 3; a++) {
+    quickAxisReachable[a] = false;
+    quickAxisEstimatedDac[a] = 0.0;
+  }
+  integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+}
+
+void processCommand(const char *line) {
+  line = skipSpacesIntegrated(line);
+  if (*line == '\0') return;
+
+  char c = static_cast<char>(tolower(static_cast<unsigned char>(*line)));
+  const char *arg = skipSpacesIntegrated(line + 1);
+
+  if (c == '?') {
+    printIntegratedHelp();
+    return;
+  }
+
+  if (c == 's' && *arg == '\0') {
+    emergencyStopRequested = true;
+    resetIntegratedWorkflowAfterStop();
+    Serial.println("VISATON STOPPED. Integrated baseline cleared. Start next cycle with a.");
+    return;
+  }
+
+  if (automaticTestRunning) {
+    Serial.println("Automatic experiment active. Only emergency stop s is accepted.");
+    return;
+  }
+
+  if (c == 'a' && *arg == '\0') {
+    emergencyStopRequested = false;
+    runIntegratedDiscovery();
+    return;
+  }
+
+  if (c == 'd' && *arg == '\0') {
+    emergencyStopRequested = false;
+    runQuickDacAuthoritySweep();
+    return;
+  }
+
+  if ((c == 'x' || c == 'y' || c == 'z') && *arg == '\0') {
+    selectIntegratedAxis(c);
+    return;
+  }
+
+  if (c == 'c' && *arg == '\0') {
+    emergencyStopRequested = false;
+    runIntegratedAmplitudeMatch();
+    return;
+  }
+
+  if (c == 'i' && *arg == '\0') {
+    emergencyStopRequested = false;
+    runFxSecondaryPathIdentification();
+    return;
+  }
+
+  if (c == 'l') {
+    uint8_t seconds = 20;
+    if (*arg != '\0') {
+      char *endPtr = nullptr;
+      long parsed = strtol(arg, &endPtr, 10);
+      if (endPtr == arg) {
+        Serial.println("Usage: l 20   (adaptive duration 5..60 s)");
+        return;
+      }
+      seconds = static_cast<uint8_t>(clampDouble(parsed, FX_MIN_ADAPT_SECONDS, FX_MAX_ADAPT_SECONDS));
+    }
+    emergencyStopRequested = false;
+    runFxLms(seconds);
+    return;
+  }
+
+  if (c == 'b' && *arg == '\0') {
+    emergencyStopRequested = false;
+    runFxCausalAbab();
+    return;
+  }
+
+  if (c == 'u') {
+    if (*arg == '\0') {
+      Serial.print("Current FxLMS normal mu = "); Serial.println(fxNormalMu, 5);
+      return;
+    }
+    char *endPtr = nullptr;
+    double value = strtod(arg, &endPtr);
+    if (endPtr == arg || !isfinite(value) || value < FX_MIN_USER_MU || value > FX_MAX_USER_MU) {
+      Serial.print("Usage: u <mu>, range "); Serial.print(FX_MIN_USER_MU, 3);
+      Serial.print(" .. "); Serial.println(FX_MAX_USER_MU, 3);
+      return;
+    }
+    fxNormalMu = value;
+    Serial.print("FxLMS normal mu set to "); Serial.println(fxNormalMu, 5);
+    return;
+  }
+
+  if (c == 'w' && *arg == '\0') {
+    emergencyStopRequested = false;
+    runIntegratedPhaseSweep();
+    return;
+  }
+
+  if (c == 'g' && *arg == '\0') {
+    if (!visatonRunning) {
+      Serial.println("g requires the Visaton NCO to be running (for example during Stage C).");
+      return;
+    }
+    VectorFftResult fft = {};
+    runLocalVectorFft(fft);
+    printFftResult(fft);
+    return;
+  }
+
+  if (c == 'p' && *arg == '\0') {
+    printIntegratedSettings();
+    return;
+  }
+
+  Serial.println("Unknown command. Type ? for help.");
+}
+
+// ============================================================================
+// SETUP / LOOP - INTEGRATED CONTROLLER
+// ============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(PIN_CS_ADXL1, OUTPUT);
+  pinMode(PIN_CS_ADXL2, OUTPUT);
+  digitalWrite(PIN_CS_ADXL1, HIGH);
+  digitalWrite(PIN_CS_ADXL2, HIGH);
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+
+  pinMode(PIN_VISATON_DAC, OUTPUT);
+  dacWrite(PIN_VISATON_DAC, 128);
+
+  Serial.println();
+  Serial.println("================================================================================");
+  Serial.println("KK INTEGRATED FFT/QUAD + V5.1R + COMPLEX FXLMS V1.4 AXIS CHARACTERIZATION");
+  Serial.println("ADXL1 GPIO5  = TOOL / reference");
+  Serial.println("ADXL2 GPIO17 = BACK-OF-HAND / error sensor");
+  Serial.println("Tool discovery band HARD-CODED to 240..320 Hz");
+  Serial.println("5 MHz SPI Mode 3 | 1600 Hz paired acquisition | 10 kHz phase-continuous NCO");
+  Serial.println("================================================================================");
+
+  if (!initializeReferenceAdxl1()) {
+    Serial.println("ADXL1 initialization failed once; deselecting SPI devices and retrying...");
+    deselectBothAdxl();
+    delay(100);
+    if (!initializeReferenceAdxl1()) {
+      Serial.println("FATAL: ADXL1 initialization failed on GPIO5 after retry.");
+      while (true) { dacWrite(PIN_VISATON_DAC, 128); delay(1000); }
+    }
+  }
+
+  if (!initializeAdxl2()) {
+    Serial.println("ADXL2 initialization failed once; deselecting SPI devices and retrying...");
+    deselectBothAdxl();
+    delay(100);
+    if (!initializeAdxl2()) {
+      Serial.println("FATAL: ADXL2 initialization failed on GPIO17 after retry.");
+      while (true) { dacWrite(PIN_VISATON_DAC, 128); delay(1000); }
+    }
+  }
+
+  if (!initializeVisatonTimer()) {
+    Serial.println("FATAL: hardware timer initialization failed.");
+    while (true) {
+      dacWrite(PIN_VISATON_DAC, 128);
+      delay(1000);
+    }
+  }
+
+  clearSlopeHistory();
+  integratedWorkflowState = IntegratedWorkflowState::NEED_BASELINE;
+  printIntegratedHelp();
+  printIntegratedSettings();
+  Serial.println("Ready. Normal FxLMS: TOOL ON -> a -> x/y/z; TOOL OFF -> i; TOOL ON -> l 20. After a valid frozen run, b performs causal A-B-A-B. d/c remain optional.");
+}
+
+void loop() {
+  while (Serial.available()) {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      commandBuffer[commandLength] = '\0';
+      processCommand(commandBuffer);
+      commandLength = 0;
+      commandBuffer[0] = '\0';
+    } else if (commandLength + 1 < COMMAND_BUFFER_SIZE) {
+      commandBuffer[commandLength++] = c;
+    }
+  }
+  delay(2);
+}

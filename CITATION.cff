@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use this work, please cite the Master's thesis."
+title: "Active Vibration Control for a Wearable Hand Exoskeleton"
+authors:
+  - family-names: Ramamurthi
+    given-names: Krishna Kumar
+date-released: 2026-09-29
+license: MIT
+preferred-citation:
+  type: thesis
+  thesis-type: "Master's thesis"
+  title: "Design and development of a vibration-damping hand-arm-exoskeleton"
+  authors:
+    - family-names: Ramamurthi
+      given-names: Krishna Kumar
+  institution:
+    name: "TU Bergakademie Freiberg"
+  year: 2026
